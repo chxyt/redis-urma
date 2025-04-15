@@ -1480,6 +1480,16 @@ typedef struct redisTLSContextConfig {
     int session_cache_size;
     int session_cache_timeout;
 } redisTLSContextConfig;
+/*-----------------------------------------------------------------------------
+ * RDMA Context Configuration
+ *----------------------------------------------------------------------------*/
+typedef struct serverRdmaContextConfig {
+    char *bindaddr[CONFIG_BINDADDR_MAX];
+    int bindaddr_count;
+    int port;
+    int rx_size;
+    int completion_vector;
+} serverRdmaContextConfig;
 
 /*-----------------------------------------------------------------------------
  * AOF manifest definition
@@ -2026,6 +2036,9 @@ struct redisServer {
     int tls_replication;
     int tls_auth_clients;
     redisTLSContextConfig tls_ctx_config;
+    
+    serverRdmaContextConfig rdma_ctx_config;
+
     /* cpu affinity */
     char *server_cpulist; /* cpu affinity list of redis server main/io thread. */
     char *bio_cpulist; /* cpu affinity list of bio thread. */
@@ -3020,7 +3033,7 @@ void removeSignalHandlers(void);
 int createSocketAcceptHandler(connListener *sfd, aeFileProc *accept_handler);
 connListener *listenerByType(const char *typename);
 int changeListener(connListener *listener);
-void closeListener(connListener *listener);
+// void closeListener(connListener *listener);
 struct redisCommand *lookupSubcommand(struct redisCommand *container, sds sub_name);
 struct redisCommand *lookupCommand(robj **argv, int argc);
 struct redisCommand *lookupCommandBySdsLogic(dict *commands, sds s);
@@ -3170,6 +3183,10 @@ sds keyspaceEventsFlagsToString(int flags);
 #define MEMORY_CONFIG (1<<0) /* Indicates if this value can be loaded as a memory value */
 #define PERCENT_CONFIG (1<<1) /* Indicates if this value can be loaded as a percent (and stored as a negative int) */
 #define OCTAL_CONFIG (1<<2) /* This value uses octal representation */
+
+#ifndef MAX_ACCEPTS_PER_CALL
+#define MAX_ACCEPTS_PER_CALL 1000
+#endif
 
 /* Enum Configs contain an array of configEnum objects that match a string with an integer. */
 typedef struct configEnum {

@@ -306,6 +306,30 @@ ifeq ($(BUILD_TLS),module)
 	TLS_MODULE_CFLAGS+=-DUSE_OPENSSL=$(BUILD_MODULE) $(OPENSSL_CFLAGS) -DBUILD_TLS_MODULE=$(BUILD_MODULE)
 endif
 
+
+RDMA_LIBS=
+RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
+ifeq ($(RDMA_PKGCONFIG),0)
+	RDMA_LIBS=$(shell $(PKG_CONFIG) --libs librdmacm libibverbs)
+else
+	RDMA_LIBS=-lrdmacm -libverbs
+endif
+
+ifeq ($(BUILD_RDMA),yes)
+	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_YES) -DBUILD_RDMA_MODULE=$(BUILD_NO)
+	FINAL_LIBS += $(RDMA_LIBS)
+endif
+
+RDMA_MODULE=
+RDMA_MODULE_NAME:=valkey-rdma$(PROG_SUFFIX).so
+RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
+ifeq ($(BUILD_RDMA),module)
+	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE)
+	RDMA_MODULE=$(RDMA_MODULE_NAME)
+	RDMA_MODULE_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) -DBUILD_RDMA_MODULE=$(BUILD_MODULE) $(RDMA_LIBS)
+endif
+
+
 ifndef V
     define MAKE_INSTALL
         @printf '    %b %b\n' $(LINKCOLOR)INSTALL$(ENDCOLOR) $(BINCOLOR)$(1)$(ENDCOLOR) 1>&2
@@ -353,6 +377,12 @@ REDIS_BENCHMARK_OBJ=ae.o anet.o redis-benchmark.o adlist.o dict.o zmalloc.o redi
 REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
 ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
+
+ifeq ($(BUILD_RDMA),yes)
+    REDIS_CFLAGS += -DBUILD_RDMA
+    REDIS_LDFLAGS += -lrdmacm -libverbs
+    REDIS_SERVER_OBJ += rdma.o
+endif
 
 all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE)
 	@echo ""
@@ -441,6 +471,8 @@ ifneq (,$(PYTHON))
 $(COMMANDS_DEF_FILENAME).def: commands/*.json ../utils/generate-command-code.py
 	$(QUIET_GEN)$(PYTHON) ../utils/generate-command-code.py $(GEN_COMMANDS_FLAGS)
 endif
+
+
 
 commands.c: $(COMMANDS_DEF_FILENAME).def
 

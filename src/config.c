@@ -591,9 +591,27 @@ void loadServerConfigFromString(char *config) {
                 }
                 queueSentinelConfig(argv+1,argc-1,linenum,lines[i]);
             }
-        } else {
-            err = "Bad directive or wrong number of arguments"; goto loaderr;
-        }
+            /* RDMA configuration */
+            else if (!strcasecmp(argv[0],"rdma-port") && argc == 2) {
+                    server.rdma_ctx_config.port = atoi(argv[1]);
+                } else if (!strcasecmp(argv[0],"rdma-bind") && argc >= 2) {
+                    if (argc - 1 > CONFIG_BINDADDR_MAX) {
+                        err = "Too many rdma-bind addresses specified";
+                        goto loaderr;
+                    }
+                    server.rdma_ctx_config.bindaddr_count = argc - 1;
+                    for (int j = 0; j < server.rdma_ctx_config.bindaddr_count; j++) {
+                        server.rdma_ctx_config.bindaddr[j] = zstrdup(argv[j+1]);
+                    }
+                } else if (!strcasecmp(argv[0],"rdma-rx-size") && argc == 2) {
+                    server.rdma_ctx_config.rx_size = memtoll(argv[1], &err);
+                    if (err) goto loaderr;
+                } else if (!strcasecmp(argv[0],"rdma-completion-vector") && argc == 2) {
+                    server.rdma_ctx_config.completion_vector = atoi(argv[1]);
+                }
+                } else {
+                    err = "Bad directive or wrong number of arguments"; goto loaderr;
+                }
         sdsfreesplitres(argv,argc);
         argv = NULL;
     }
@@ -2599,7 +2617,7 @@ static int applyBind(const char **err) {
     if (changeListener(tcp_listener) == C_ERR) {
         *err = "Failed to bind to specified addresses.";
         if (tls_listener)
-            closeListener(tls_listener); /* failed with TLS together */
+            connCloseListener(tls_listener); /* failed with TLS together */
         return 0;
     }
 
@@ -2611,7 +2629,7 @@ static int applyBind(const char **err) {
         tls_listener->ct = connectionByType(CONN_TYPE_TLS);
         if (changeListener(tls_listener) == C_ERR) {
             *err = "Failed to bind to specified addresses.";
-            closeListener(tcp_listener); /* failed with TCP together */
+            connCloseListener(tcp_listener); /* failed with TCP together */
             return 0;
         }
     }
@@ -3048,7 +3066,7 @@ static int applyClientMaxMemoryUsage(const char **err) {
 }
 
 standardConfig static_configs[] = {
-    /* Bool configs */
+    
     createBoolConfig("rdbchecksum", NULL, IMMUTABLE_CONFIG, server.rdb_checksum, 1, NULL, NULL),
     createBoolConfig("daemonize", NULL, IMMUTABLE_CONFIG, server.daemonize, 0, NULL, NULL),
     createBoolConfig("io-threads-do-reads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, server.io_threads_do_reads, 0,NULL, NULL), /* Read + parse from threads? */
@@ -3146,6 +3164,18 @@ standardConfig static_configs[] = {
     createEnumConfig("shutdown-on-sigterm", NULL, MODIFIABLE_CONFIG | MULTI_ARG_CONFIG, shutdown_on_sig_enum, server.shutdown_on_sigterm, 0, isValidShutdownOnSigFlags, NULL),
 
     /* Integer configs */
+createIntConfig(
+    "rdma-port",             // name
+    NULL,                    // alias
+    IMMUTABLE_CONFIG,        // flags
+    1,                       // lower bound (valid port)
+    65535,                   // upper bound
+    server.rdma_ctx_config.port, // storage
+    6380,                    // default
+    0,                       // num_conf_flags
+    NULL,                    // is_valid
+    NULL                     // apply
+),
     createIntConfig("databases", NULL, IMMUTABLE_CONFIG, 1, INT_MAX, server.dbnum, 16, INTEGER_CONFIG, NULL, NULL),
     createIntConfig("port", NULL, MODIFIABLE_CONFIG, 0, 65535, server.port, 6379, INTEGER_CONFIG, NULL, updatePort), /* TCP port. */
     createIntConfig("io-threads", NULL, DEBUG_CONFIG | IMMUTABLE_CONFIG, 1, 128, server.io_threads_num, 1, INTEGER_CONFIG, NULL, NULL), /* Single threaded by default */
