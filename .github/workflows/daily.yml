@@ -891,7 +891,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: vmactions/freebsd-vm@v0.3.1
+      uses: vmactions/freebsd-vm@v1.5.9
       with:
         usesh: true
         sync: rsync
@@ -923,7 +923,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: vmactions/freebsd-vm@v0.3.1
+      uses: vmactions/freebsd-vm@v1.5.9
       with:
         usesh: true
         sync: rsync
@@ -954,7 +954,7 @@ jobs:
         repository: ${{ env.GITHUB_REPOSITORY }}
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: test
-      uses: vmactions/freebsd-vm@v0.3.1
+      uses: vmactions/freebsd-vm@v1.5.9
       with:
         usesh: true
         sync: rsync
