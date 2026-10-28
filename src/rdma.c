@@ -1,10 +1,19 @@
 /* ==========================================================================
- * rdma.c - support RDMA protocol for transport layer.
+ * rdma.c - support RDMA protocol for transport layer, based on URMA (umdk).
  * --------------------------------------------------------------------------
  * Copyright (C) 2021-2024  zhenwei pi <pizhenwei@bytedance.com>
  *
  * This work is licensed under BSD 3-Clause, License 1 of the COPYING file in
  * the top-level directory.
+ *
+ * URMA port notes:
+ * - ibv verbs   -> URMA: context/jfc/jetty/seg
+ * - rdma_cm     -> replaced by an out-of-band TCP control channel, the two
+ *                  peers exchange their urma_rjetty_t over TCP, then
+ *                  urma_import_jetty() + urma_bind_jetty() to establish the
+ *                  RC transport channel.
+ * - data path   -> WRITE with immediate data onto the remote registered
+ *                  transfer buffer, control commands via SEND/RECV.
  * ==========================================================================
  */
 
@@ -18,11 +27,14 @@
 
 #include <assert.h>
 #include <arpa/inet.h>
-#include <rdma/rdma_cma.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <netdb.h>
+
+#include <urma/urma_api.h>
+#include <urma/urma_types.h>
+#include <urma/urma_opcode.h>
 
 #define CONN_TYPE_RDMA "rdma"
 
@@ -30,37 +42,35 @@
 #define MIN(a,b) ((a) < (b) ? (a) : (b))
 #endif
 
-
-int max = 1000;  // Replace server.max_new_conns_per_cycle
-
-
 typedef struct ValkeyRdmaFeature {
     /* defined as following Opcodes */
     uint16_t opcode;
     /* select features */
     uint16_t select;
-    uint8_t rsvd[20];
+    uint8_t rsvd[4];
     /* feature bits */
     uint64_t features;
+    uint8_t rsvd2[48];
 } ValkeyRdmaFeature;
 
 typedef struct ValkeyRdmaKeepalive {
     /* defined as following Opcodes */
     uint16_t opcode;
-    uint8_t rsvd[30];
+    uint8_t rsvd[62];
 } ValkeyRdmaKeepalive;
 
 typedef struct ValkeyRdmaMemory {
     /* defined as following Opcodes */
     uint16_t opcode;
-    uint8_t rsvd[14];
-    /* address of a transfer buffer which is used to receive remote streaming data,
-     * aka 'RX buffer address'. The remote side should use this as 'TX buffer address' */
-    uint64_t addr;
-    /* length of the 'RX buffer' */
-    uint32_t length;
-    /* the RDMA remote key of 'RX buffer' */
-    uint32_t key;
+    uint8_t rsvd[6];
+    /* the urma segment descriptor of a transfer buffer which is used to
+     * receive remote streaming data, aka 'RX buffer'. The remote side should
+     * import this segment and write into it. Note that the descriptor is
+     * exchanged in raw form, both ends are assumed to run the same build. */
+    urma_seg_t seg;
+    /* the token of the 'RX buffer' segment */
+    uint32_t token;
+    uint8_t rsvd2[4];
 } ValkeyRdmaMemory;
 
 typedef union ValkeyRdmaCmd {
@@ -85,51 +95,80 @@ typedef enum ValkeyRdmaOpcode {
 #define VALKEY_RDMA_INVALID_OPCODE 0xffff
 #define VALKEY_RDMA_KEEPALIVE_MS 3000
 
+/* token used locally for imported jets/segments protection table */
+#define VALKEY_RDMA_JETTY_TOKEN 0xABCDEF
+
+/* handshake state over the out-of-band TCP channel */
+typedef enum RdmaHsState {
+    HS_NONE = 0,      /* TCP connecting */
+    HS_LOCAL_SENT,    /* our rjetty has been sent, waiting for peer rjetty */
+    HS_ESTABLISHED,   /* RC transport channel established */
+} RdmaHsState;
+
 typedef struct rdma_connection {
     connection c;
-    struct rdma_cm_id *cm_id;
+    int cfd;               /* out-of-band TCP control channel, -1 after established */
+    struct RdmaContext *ctx;
     int last_errno;
     listNode *pending_list_node;
 } rdma_connection;
 
 typedef struct RdmaXfer {
-    struct ibv_mr *mr; /* memory region of the transfer buffer */
     char *addr;        /* address of transfer buffer in local memory */
     uint32_t length;   /* bytes of transfer buffer */
     uint32_t offset;   /* the offset of consumed transfer buffer */
     uint32_t pos;      /* the position in use of the transfer buffer */
+    uint32_t token;    /* token of the registered segment */
 } RdmaXfer;
 
 typedef struct RdmaContext {
     connection *conn;
-    char *ip;
-    int port;
+    char *ip;               /* peer address */
+    int port;               /* peer port */
+    char *lip;              /* local address */
+    int lport;              /* local port */
     long long keepalive_te; /* RDMA has no transport layer keepalive */
-    struct ibv_pd *pd;
-    struct rdma_event_channel *cm_channel;
-    struct ibv_comp_channel *comp_channel;
-    struct ibv_cq *cq;
+
+    /* URMA resources */
+    urma_context_t *uctx;
+    urma_jfce_t *jfce;
+    urma_jfc_t *jfc;
+    urma_jfr_t *jfr;
+    urma_jetty_t *jetty;
+    urma_target_jetty_t *tjetty; /* remote jetty imported from peer */
+    int bound;                   /* jetty bound with remote peer */
+    int max_sge;                 /* device capability */
+
+    /* handshake state */
+    RdmaHsState hs_state;
+    urma_rjetty_t local_rjetty;
+    urma_rjetty_t peer_rjetty;
+    size_t hs_sent; /* bytes of local rjetty already sent */
+    size_t hs_got;  /* bytes of peer rjetty already received */
 
     /* TX */
     RdmaXfer tx;
-    char *tx_addr;      /* remote transfer buffer address */
-    uint32_t tx_key;    /* remote transfer buffer key */
-    uint32_t tx_length; /* remote transfer buffer length */
-    uint32_t tx_offset; /* remote transfer buffer offset */
-    uint32_t tx_ops;    /* operations on remote transfer */
+    urma_target_seg_t *tx_tseg;        /* locally registered transfer buffer */
+    urma_target_seg_t *remote_rx_tseg; /* imported remote RX buffer */
+    urma_seg_t remote_rx_seg;          /* raw descriptor of remote RX buffer */
+    uint64_t tx_remote_addr;           /* remote transfer buffer address */
+    uint32_t tx_key;                   /* remote transfer buffer token */
+    uint32_t tx_length;                /* remote transfer buffer length */
+    uint32_t tx_offset;                /* remote transfer buffer offset */
+    uint32_t tx_ops;                   /* operations on remote transfer */
 
     /* RX */
     RdmaXfer rx;
+    urma_target_seg_t *rx_tseg;
 
     /* CMD 0 ~ VALKEY_RDMA_MAX_WQE for recv buffer
      * VALKEY_RDMA_MAX_WQE ~ 2 * VALKEY_RDMA_MAX_WQE -1 for send buffer */
     ValkeyRdmaCmd *cmd_buf;
-    struct ibv_mr *cmd_mr;
+    urma_target_seg_t *cmd_tseg;
 } RdmaContext;
 
 typedef struct rdma_listener {
-    struct rdma_cm_id *cm_id;
-    struct rdma_event_channel *cm_channel;
+    int fd; /* TCP listening socket, acts as the out-of-band channel */
 } rdma_listener;
 
 /* RDMA connection is always writable, it has no POLLOUT event to drive the write handler, record available write
@@ -168,10 +207,10 @@ static inline int connRdmaAllowRW(connection *conn) {
     return connRdmaAllowCommand();
 }
 
-static int rdmaPostRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd) {
-    struct ibv_sge sge;
-    size_t length = sizeof(ValkeyRdmaCmd);
-    struct ibv_recv_wr recv_wr, *bad_wr;
+static int rdmaPostRecv(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
+    urma_jfr_wr_t wr = {0};
+    urma_sge_t sge;
+    urma_jfr_wr_t *bad_wr;
     int ret;
 
     if (connRdmaAllowCommand()) {
@@ -179,16 +218,17 @@ static int rdmaPostRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCm
     }
 
     sge.addr = (uint64_t)cmd;
-    sge.length = length;
-    sge.lkey = ctx->cmd_mr->lkey;
+    sge.len = sizeof(ValkeyRdmaCmd);
+    sge.tseg = ctx->cmd_tseg;
+    sge.user_tseg = NULL;
 
-    recv_wr.wr_id = (uint64_t)cmd;
-    recv_wr.sg_list = &sge;
-    recv_wr.num_sge = 1;
-    recv_wr.next = NULL;
+    wr.src.sge = &sge;
+    wr.src.num_sge = 1;
+    wr.user_ctx = (uint64_t)cmd;
+    wr.next = NULL;
 
-    ret = ibv_post_recv(cm_id->qp, &recv_wr, &bad_wr);
-    if (ret && (ret != EAGAIN)) {
+    ret = urma_post_jetty_recv_wr(ctx->jetty, &wr, &bad_wr);
+    if (ret && (ret != URMA_EAGAIN)) {
         serverLog(LL_WARNING, "RDMA: post recv failed: %d", ret);
         return C_ERR;
     }
@@ -203,9 +243,8 @@ static int rdmaPostRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCm
  * 0x7f2764ac5000      -      0x7f2764ac7000
  * |ptr0 128| ... |ptr1 4096| ... |ptr2 512|
  *
- * After ibv_reg_mr(pd, ptr1, 4096, access), the full range of 8K
- * becomes DONTFORK. And the child process will hit a segment fault
- * during access ptr0/ptr2.
+ * After registering the range of 8K becomes DONTFORK. And the child
+ * process will hit a segment fault during access ptr0/ptr2.
  * Note that the memory can be freed by libc free only.
  * TODO: move it to zmalloc.c if necessary
  */
@@ -224,49 +263,54 @@ static void *page_aligned_zalloc(size_t size) {
 }
 
 static void rdmaDestroyIoBuf(RdmaContext *ctx) {
-    if (ctx->rx.mr) {
-        ibv_dereg_mr(ctx->rx.mr);
-        ctx->rx.mr = NULL;
+    if (ctx->rx_tseg) {
+        urma_unregister_seg(ctx->rx_tseg);
+        ctx->rx_tseg = NULL;
     }
 
     zlibc_free(ctx->rx.addr);
     ctx->rx.addr = NULL;
 
-    if (ctx->tx.mr) {
-        ibv_dereg_mr(ctx->tx.mr);
-        ctx->tx.mr = NULL;
+    if (ctx->tx_tseg) {
+        urma_unregister_seg(ctx->tx_tseg);
+        ctx->tx_tseg = NULL;
     }
 
     zlibc_free(ctx->tx.addr);
     ctx->tx.addr = NULL;
 
-    if (ctx->cmd_mr) {
-        ibv_dereg_mr(ctx->cmd_mr);
-        ctx->cmd_mr = NULL;
+    if (ctx->cmd_tseg) {
+        urma_unregister_seg(ctx->cmd_tseg);
+        ctx->cmd_tseg = NULL;
     }
 
     zlibc_free(ctx->cmd_buf);
     ctx->cmd_buf = NULL;
 }
 
-static int rdmaSetupIoBuf(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
-    int access = IBV_ACCESS_LOCAL_WRITE;
+static int rdmaSetupIoBuf(RdmaContext *ctx) {
+    urma_seg_cfg_t seg_cfg = {0};
     size_t length = sizeof(ValkeyRdmaCmd) * VALKEY_RDMA_MAX_WQE * 2;
     ValkeyRdmaCmd *cmd;
     int i;
 
-    /* setup CMD buf & MR */
+    /* setup CMD buf & segment, only local access */
     ctx->cmd_buf = page_aligned_zalloc(length);
-    ctx->cmd_mr = ibv_reg_mr(ctx->pd, ctx->cmd_buf, length, access);
-    if (!ctx->cmd_mr) {
-        serverLog(LL_WARNING, "RDMA: reg mr for CMD failed");
+    seg_cfg.va = (uint64_t)ctx->cmd_buf;
+    seg_cfg.len = length;
+    seg_cfg.token_id = NULL; /* urma allocates and frees the token id */
+    seg_cfg.token_value.token = 0;
+    seg_cfg.flag.bs.access = URMA_ACCESS_LOCAL_ONLY;
+    ctx->cmd_tseg = urma_register_seg(ctx->uctx, &seg_cfg);
+    if (!ctx->cmd_tseg) {
+        serverLog(LL_WARNING, "RDMA: register seg for CMD failed");
         goto destroy_iobuf;
     }
 
     for (i = 0; i < VALKEY_RDMA_MAX_WQE; i++) {
         cmd = ctx->cmd_buf + i;
 
-        if (rdmaPostRecv(ctx, cm_id, cmd) == C_ERR) {
+        if (rdmaPostRecv(ctx, cmd) == C_ERR) {
             serverLog(LL_WARNING, "RDMA: post recv failed");
             goto destroy_iobuf;
         }
@@ -277,14 +321,19 @@ static int rdmaSetupIoBuf(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
         cmd->keepalive.opcode = VALKEY_RDMA_INVALID_OPCODE;
     }
 
-    /* setup recv buf & MR */
-    access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    /* setup recv buf & segment, accessible by the remote peer */
     length = rdma_config->rx_size;
     ctx->rx.addr = page_aligned_zalloc(length);
     ctx->rx.length = length;
-    ctx->rx.mr = ibv_reg_mr(ctx->pd, ctx->rx.addr, length, access);
-    if (!ctx->rx.mr) {
-        serverLog(LL_WARNING, "RDMA: reg mr for recv buffer failed");
+    ctx->rx.token = VALKEY_RDMA_JETTY_TOKEN;
+    seg_cfg.va = (uint64_t)ctx->rx.addr;
+    seg_cfg.len = length;
+    seg_cfg.token_id = NULL;
+    seg_cfg.token_value.token = ctx->rx.token;
+    seg_cfg.flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    ctx->rx_tseg = urma_register_seg(ctx->uctx, &seg_cfg);
+    if (!ctx->rx_tseg) {
+        serverLog(LL_WARNING, "RDMA: register seg for recv buffer failed");
         goto destroy_iobuf;
     }
 
@@ -296,108 +345,189 @@ destroy_iobuf:
 }
 
 
-static int rdmaCreateResource(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
-    int ret = C_OK;
-    struct ibv_device_attr device_attr;
-    struct ibv_qp_init_attr init_attr;
-    struct ibv_comp_channel *comp_channel = NULL;
-    struct ibv_cq *cq = NULL;
-    struct ibv_pd *pd = NULL;
-    int comp_vector = rdma_config->completion_vector;
-
-    if (ibv_query_device(cm_id->verbs, &device_attr)) {
-        serverLog(LL_WARNING, "RDMA: ibv ibv query device failed");
-        return C_ERR;
-    }
-
-    pd = ibv_alloc_pd(cm_id->verbs);
-    if (!pd) {
-        serverLog(LL_WARNING, "RDMA: ibv alloc pd failed");
-        return C_ERR;
-    }
-
-    ctx->pd = pd;
-
-    comp_channel = ibv_create_comp_channel(cm_id->verbs);
-    if (!comp_channel) {
-        serverLog(LL_WARNING, "RDMA: ibv create comp channel failed");
-        return C_ERR;
-    }
-
-    ctx->comp_channel = comp_channel;
+static int rdmaCreateResource(RdmaContext *ctx) {
+    urma_device_t **dev_list = NULL;
+    urma_device_attr_t dev_attr = {0};
+    urma_jfc_cfg_t jfc_cfg = {0};
+    urma_jfr_cfg_t jfr_cfg = {0};
+    urma_jetty_cfg_t jetty_cfg = {0};
+    int num_devices = 0;
+    int ceqn = rdma_config->completion_vector;
+    int ret = C_ERR;
 
     /* negative number means a random one */
-    if (comp_vector < 0) {
-        comp_vector = abs((int)random());
+    if (ceqn < 0) {
+        ceqn = 0;
     }
 
-    cq = ibv_create_cq(cm_id->verbs, VALKEY_RDMA_MAX_WQE * 2, NULL, comp_channel,
-                       comp_vector % cm_id->verbs->num_comp_vectors);
-    if (!cq) {
-        serverLog(LL_WARNING, "RDMA: ibv create cq failed");
+    dev_list = urma_get_device_list(&num_devices);
+    if (!dev_list || num_devices <= 0) {
+        serverLog(LL_WARNING, "RDMA: no urma device found");
+        if (dev_list) urma_free_device_list(dev_list);
         return C_ERR;
     }
+    ctx->max_sge = 1;
 
-    ctx->cq = cq;
-    ibv_req_notify_cq(cq, 0);
+    if (urma_query_device(dev_list[0], &dev_attr)) {
+        serverLog(LL_WARNING, "RDMA: urma query device failed");
+        goto out;
+    }
+    ctx->max_sge = dev_attr.dev_cap.max_jfs_sge;
 
-    memset(&init_attr, 0, sizeof(init_attr));
-    init_attr.cap.max_send_wr = VALKEY_RDMA_MAX_WQE;
-    init_attr.cap.max_recv_wr = VALKEY_RDMA_MAX_WQE;
-    init_attr.cap.max_send_sge = device_attr.max_sge;
-    init_attr.cap.max_recv_sge = 1;
-    init_attr.qp_type = IBV_QPT_RC;
-    init_attr.send_cq = cq;
-    init_attr.recv_cq = cq;
-    ret = rdma_create_qp(cm_id, pd, &init_attr);
-    if (ret) {
-        serverLog(LL_WARNING, "RDMA: create qp failed");
-        return C_ERR;
+    ctx->uctx = urma_create_context(dev_list[0], 0);
+    if (!ctx->uctx) {
+        serverLog(LL_WARNING, "RDMA: urma create context failed");
+        goto out;
     }
 
-    if (rdmaSetupIoBuf(ctx, cm_id)) {
-        return C_ERR;
+    ctx->jfce = urma_create_jfce(ctx->uctx);
+    if (!ctx->jfce) {
+        serverLog(LL_WARNING, "RDMA: urma create jfce failed");
+        goto out;
     }
 
-    return C_OK;
+    /* jfc depth must cover jfs + jfr depths */
+    jfc_cfg.depth = VALKEY_RDMA_MAX_WQE * 2;
+    jfc_cfg.ceqn = ceqn;
+    jfc_cfg.jfce = ctx->jfce;
+    ctx->jfc = urma_create_jfc(ctx->uctx, &jfc_cfg);
+    if (!ctx->jfc) {
+        serverLog(LL_WARNING, "RDMA: urma create jfc failed");
+        goto out;
+    }
+
+    jfr_cfg.depth = VALKEY_RDMA_MAX_WQE;
+    jfr_cfg.trans_mode = URMA_TM_RC;
+    jfr_cfg.max_sge = 1;
+    jfr_cfg.min_rnr_timer = URMA_TYPICAL_MIN_RNR_TIMER;
+    jfr_cfg.jfc = ctx->jfc;
+    jfr_cfg.token_value.token = VALKEY_RDMA_JETTY_TOKEN;
+    ctx->jfr = urma_create_jfr(ctx->uctx, &jfr_cfg);
+    if (!ctx->jfr) {
+        serverLog(LL_WARNING, "RDMA: urma create jfr failed");
+        goto out;
+    }
+
+    jetty_cfg.flag.bs.share_jfr = 1;
+    jetty_cfg.jfs_cfg.depth = VALKEY_RDMA_MAX_WQE;
+    jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RC;
+    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jetty_cfg.jfs_cfg.max_sge = 1;
+    jetty_cfg.jfs_cfg.max_inline_data = 0;
+    jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
+    jetty_cfg.jfs_cfg.err_timeout = URMA_TYPICAL_ERR_TIMEOUT;
+    jetty_cfg.jfs_cfg.jfc = ctx->jfc;
+    jetty_cfg.shared.jfr = ctx->jfr;
+    ctx->jetty = urma_create_jetty(ctx->uctx, &jetty_cfg);
+    if (!ctx->jetty) {
+        serverLog(LL_WARNING, "RDMA: urma create jetty failed");
+        goto out;
+    }
+
+    if (rdmaSetupIoBuf(ctx)) {
+        goto out;
+    }
+
+    /* arm the jfc, so the jfce fd is signaled on completion */
+    if (urma_rearm_jfc(ctx->jfc, false)) {
+        serverLog(LL_WARNING, "RDMA: rearm jfc failed");
+        goto out;
+    }
+
+    /* get the exchangeable remote jetty information of ours */
+    {
+        urma_rjetty_t *rjetty = NULL;
+        uint32_t length = 0;
+
+        if (urma_get_rjetty(ctx->jetty, &rjetty, &length) || !rjetty ||
+            length < sizeof(urma_rjetty_t)) {
+            serverLog(LL_WARNING, "RDMA: get rjetty failed");
+            if (rjetty) urma_put_rjetty(rjetty);
+            goto out;
+        }
+        memcpy(&ctx->local_rjetty, rjetty, sizeof(urma_rjetty_t));
+        urma_put_rjetty(rjetty);
+    }
+
+    ret = C_OK;
+
+out:
+    if (dev_list) {
+        urma_free_device_list(dev_list);
+    }
+
+    return ret;
 }
 
 static void rdmaReleaseResource(RdmaContext *ctx) {
     rdmaDestroyIoBuf(ctx);
 
-    if (ctx->cq) {
-        ibv_destroy_cq(ctx->cq);
+    if (ctx->bound) {
+        urma_unbind_jetty(ctx->jetty);
+        ctx->bound = 0;
     }
 
-    if (ctx->comp_channel) {
-        ibv_destroy_comp_channel(ctx->comp_channel);
+    if (ctx->tjetty) {
+        urma_unimport_jetty(ctx->tjetty);
+        ctx->tjetty = NULL;
     }
 
-    if (ctx->pd) {
-        ibv_dealloc_pd(ctx->pd);
+    if (ctx->jetty) {
+        urma_delete_jetty(ctx->jetty);
+        ctx->jetty = NULL;
+    }
+
+    if (ctx->jfr) {
+        urma_delete_jfr(ctx->jfr);
+        ctx->jfr = NULL;
+    }
+
+    if (ctx->jfc) {
+        urma_delete_jfc(ctx->jfc);
+        ctx->jfc = NULL;
+    }
+
+    if (ctx->jfce) {
+        urma_delete_jfce(ctx->jfce);
+        ctx->jfce = NULL;
+    }
+
+    if (ctx->uctx) {
+        urma_delete_context(ctx->uctx);
+        ctx->uctx = NULL;
     }
 }
 
 static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
-    int access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ | IBV_ACCESS_REMOTE_WRITE;
+    urma_seg_cfg_t seg_cfg = {0};
 
     if (length == ctx->tx_length) {
         return C_OK;
     }
 
-    /* try to free old MR & buffer */
+    /* try to free old segment & buffer */
     if (ctx->tx_length) {
-        ibv_dereg_mr(ctx->tx.mr);
+        if (ctx->tx_tseg) {
+            urma_unregister_seg(ctx->tx_tseg);
+            ctx->tx_tseg = NULL;
+        }
         zlibc_free(ctx->tx.addr);
+        ctx->tx.addr = NULL;
         ctx->tx_length = 0;
     }
 
-    /* create a new buffer & MR */
+    /* create a new buffer & segment */
     ctx->tx.addr = page_aligned_zalloc(length);
     ctx->tx_length = length;
-    ctx->tx.mr = ibv_reg_mr(ctx->pd, ctx->tx.addr, length, access);
-    if (!ctx->tx.mr) {
-        serverRdmaError(server.neterr, "RDMA: reg send mr failed");
+    ctx->tx.token = VALKEY_RDMA_JETTY_TOKEN;
+    seg_cfg.va = (uint64_t)ctx->tx.addr;
+    seg_cfg.len = length;
+    seg_cfg.token_id = NULL;
+    seg_cfg.token_value.token = ctx->tx.token;
+    seg_cfg.flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    ctx->tx_tseg = urma_register_seg(ctx->uctx, &seg_cfg);
+    if (!ctx->tx_tseg) {
+        serverRdmaError(server.neterr, "RDMA: register send seg failed");
         serverLog(LL_WARNING, "RDMA: FATAL error, recv corrupted cmd");
         zlibc_free(ctx->tx.addr);
         ctx->tx.addr = NULL;
@@ -408,9 +538,10 @@ static int rdmaAdjustSendbuf(RdmaContext *ctx, unsigned int length) {
     return C_OK;
 }
 
-static int rdmaSendCommand(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd) {
-    struct ibv_send_wr send_wr, *bad_wr;
-    struct ibv_sge sge;
+static int rdmaSendCommand(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
+    urma_jfs_wr_t wr = {0};
+    urma_sge_t sge;
+    urma_jfs_wr_t *bad_wr;
     ValkeyRdmaCmd *_cmd;
     int i, ret;
 
@@ -426,16 +557,19 @@ static int rdmaSendCommand(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdm
 
     memcpy(_cmd, cmd, sizeof(ValkeyRdmaCmd));
     sge.addr = (uint64_t)_cmd;
-    sge.length = sizeof(ValkeyRdmaCmd);
-    sge.lkey = ctx->cmd_mr->lkey;
+    sge.len = sizeof(ValkeyRdmaCmd);
+    sge.tseg = ctx->cmd_tseg;
+    sge.user_tseg = NULL;
 
-    send_wr.sg_list = &sge;
-    send_wr.num_sge = 1;
-    send_wr.wr_id = (uint64_t)_cmd;
-    send_wr.opcode = IBV_WR_SEND;
-    send_wr.send_flags = IBV_SEND_SIGNALED;
-    send_wr.next = NULL;
-    ret = ibv_post_send(cm_id->qp, &send_wr, &bad_wr);
+    wr.opcode = URMA_OPC_SEND;
+    wr.tjetty = ctx->tjetty;
+    wr.user_ctx = (uint64_t)_cmd;
+    wr.flag.bs.complete_enable = 1; /* recycle the cmd buffer on send completion */
+    wr.send.src.sge = &sge;
+    wr.send.src.num_sge = 1;
+    wr.next = NULL;
+
+    ret = urma_post_jetty_send_wr(ctx->jetty, &wr, &bad_wr);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: post send failed: %d", ret);
         return C_ERR;
@@ -444,33 +578,31 @@ static int rdmaSendCommand(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdm
     return C_OK;
 }
 
-static int connRdmaRegisterRx(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
+static int connRdmaRegisterRx(RdmaContext *ctx) {
     ValkeyRdmaCmd cmd = {0};
 
     cmd.memory.opcode = htons(RegisterXferMemory);
-    cmd.memory.addr = htonu64((uint64_t)ctx->rx.addr);
-    cmd.memory.length = htonl(ctx->rx.length);
-    cmd.memory.key = htonl(ctx->rx.mr->rkey);
+    cmd.memory.seg = ctx->rx_tseg->seg;
+    cmd.memory.token = htonl(ctx->rx.token);
 
     ctx->rx.offset = 0;
     ctx->rx.pos = 0;
 
-    return rdmaSendCommand(ctx, cm_id, &cmd);
+    return rdmaSendCommand(ctx, &cmd);
 }
 
-static int connRdmaGetFeature(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd) {
+static int connRdmaGetFeature(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
     ValkeyRdmaCmd _cmd = {0};
 
     _cmd.feature.opcode = htons(GetServerFeature);
     _cmd.feature.select = cmd->feature.select;
     _cmd.feature.features = htonu64(0); /* currently no feature support */
 
-    return rdmaSendCommand(ctx, cm_id, &_cmd);
+    return rdmaSendCommand(ctx, &_cmd);
 }
 
-static int connRdmaSetFeature(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd) {
+static int connRdmaSetFeature(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
     UNUSED(ctx);
-    UNUSED(cm_id);
 
     /* currently no feature support */
     if (ntohu64(cmd->feature.features)) return C_ERR;
@@ -478,13 +610,27 @@ static int connRdmaSetFeature(RdmaContext *ctx, struct rdma_cm_id *cm_id, Valkey
     return C_OK;
 }
 
-static int rdmaHandleEstablished(struct rdma_cm_event *ev) {
-    struct rdma_cm_id *cm_id = ev->id;
-    RdmaContext *ctx = cm_id->context;
+/* import the remote RX buffer segment announced by the peer */
+static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
+    urma_import_seg_flag_t flag = {0};
+    urma_token_t token;
 
-    connRdmaRegisterRx(ctx, cm_id);
+    ctx->remote_rx_seg = cmd->memory.seg;
+    ctx->tx_remote_addr = ctx->remote_rx_seg.ubva.va;
+    ctx->tx.length = ctx->remote_rx_seg.len;
+    ctx->tx_key = ntohl(cmd->memory.token);
+    ctx->tx.offset = 0;
 
-    return C_OK;
+    flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
+    flag.bs.mapping = URMA_SEG_NOMAP;
+    token.token = ctx->tx_key;
+    ctx->remote_rx_tseg = urma_import_seg(ctx->uctx, &ctx->remote_rx_seg, &token, 0, flag);
+    if (!ctx->remote_rx_tseg) {
+        serverLog(LL_WARNING, "RDMA: import remote rx seg failed");
+        return C_ERR;
+    }
+
+    return rdmaAdjustSendbuf(ctx, ctx->tx.length);
 }
 
 static inline void rdmaDelKeepalive(aeEventLoop *el, RdmaContext *ctx) {
@@ -496,47 +642,48 @@ static inline void rdmaDelKeepalive(aeEventLoop *el, RdmaContext *ctx) {
     ctx->keepalive_te = AE_ERR;
 }
 
-static int rdmaHandleDisconnect(aeEventLoop *el, struct rdma_cm_event *ev) {
-    struct rdma_cm_id *cm_id = ev->id;
-    RdmaContext *ctx = cm_id->context;
+/* peer is gone (flushed WR / CQ error / TCP channel closed during handshake),
+ * mark this connection as closed and let the upper layer close it */
+static void rdmaHandleDisconnect(aeEventLoop *el, RdmaContext *ctx) {
     connection *conn = ctx->conn;
-    rdma_connection *rdma_conn = (rdma_connection *)conn;
+    rdma_connection *rdma_conn;
+
+    if (!conn) return;
+    rdma_conn = (rdma_connection *)conn;
 
     rdmaDelKeepalive(el, ctx);
     conn->state = CONN_STATE_CLOSED;
 
     /* we can't close connection now, let's mark this connection as closed state */
-    listAddNodeTail(pending_list, conn);
-    rdma_conn->pending_list_node = listLast(pending_list);
-
-    return C_OK;
+    if (!rdma_conn->pending_list_node) {
+        listAddNodeTail(pending_list, conn);
+        rdma_conn->pending_list_node = listLast(pending_list);
+    }
 }
 
-static int connRdmaHandleRecv(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd, uint32_t byte_len) {
+static int connRdmaHandleRecv(RdmaContext *ctx, ValkeyRdmaCmd *cmd, uint32_t byte_len) {
     if (unlikely(byte_len != sizeof(ValkeyRdmaCmd))) {
         serverLog(LL_WARNING, "RDMA: FATAL error, recv corrupted cmd");
         return C_ERR;
     }
 
     switch (ntohs(cmd->keepalive.opcode)) {
-    case GetServerFeature: connRdmaGetFeature(ctx, cm_id, cmd); break;
+    case GetServerFeature: connRdmaGetFeature(ctx, cmd); break;
 
-    case SetClientFeature: connRdmaSetFeature(ctx, cm_id, cmd); break;
+    case SetClientFeature: connRdmaSetFeature(ctx, cmd); break;
 
     case Keepalive: break;
 
     case RegisterXferMemory:
-        ctx->tx_addr = (char *)ntohu64(cmd->memory.addr);
-        ctx->tx.length = ntohl(cmd->memory.length);
-        ctx->tx_key = ntohl(cmd->memory.key);
-        ctx->tx.offset = 0;
-        rdmaAdjustSendbuf(ctx, ctx->tx.length);
+        if (connRdmaImportRemoteRx(ctx, cmd) == C_ERR) {
+            return C_ERR;
+        }
         break;
 
     default: serverLog(LL_WARNING, "RDMA: FATAL error, unknown cmd"); return C_ERR;
     }
 
-    return rdmaPostRecv(ctx, cm_id, cmd);
+    return rdmaPostRecv(ctx, cmd);
 }
 
 static int connRdmaHandleSend(ValkeyRdmaCmd *cmd) {
@@ -547,12 +694,12 @@ static int connRdmaHandleSend(ValkeyRdmaCmd *cmd) {
     return C_OK;
 }
 
-static int connRdmaHandleRecvImm(RdmaContext *ctx, struct rdma_cm_id *cm_id, ValkeyRdmaCmd *cmd, uint32_t byte_len) {
+static int connRdmaHandleRecvImm(RdmaContext *ctx, uint32_t byte_len) {
     assert(byte_len + ctx->rx.offset <= ctx->rx.length);
 
     ctx->rx.offset += byte_len;
 
-    return rdmaPostRecv(ctx, cm_id, cmd);
+    return C_OK;
 }
 
 static int connRdmaHandleWrite(RdmaContext *ctx, uint32_t byte_len) {
@@ -564,75 +711,80 @@ static int connRdmaHandleWrite(RdmaContext *ctx, uint32_t byte_len) {
 
 
 static int connRdmaHandleCq(rdma_connection *rdma_conn) {
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
-    struct ibv_cq *ev_cq = NULL;
-    void *ev_ctx = NULL;
-    struct ibv_wc wc = {0};
-    ValkeyRdmaCmd *cmd;
+    RdmaContext *ctx = rdma_conn->ctx;
+    urma_cr_t cr = {0};
+    urma_jfc_t *ev_jfc[1] = {NULL};
+    uint32_t nevents = 0;
+    int polled = 0;
+    int has_event;
     int ret;
 
-    if (ibv_get_cq_event(ctx->comp_channel, &ev_cq, &ev_ctx) < 0) {
-        if (errno != EAGAIN) {
-            serverLog(LL_WARNING, "RDMA: get CQ event error");
-            return C_ERR;
-        }
-    } else if (ibv_req_notify_cq(ev_cq, 0)) {
-        serverLog(LL_WARNING, "RDMA: notify CQ error");
-        return C_ERR;
-    }
+    has_event = urma_wait_jfc(ctx->jfce, 1, 0, ev_jfc) > 0;
 
 pollcq:
-    ret = ibv_poll_cq(ctx->cq, 1, &wc);
+    ret = urma_poll_jfc(ctx->jfc, 1, &cr);
     if (ret < 0) {
-        serverLog(LL_WARNING, "RDMA: poll recv CQ error");
+        serverLog(LL_WARNING, "RDMA: poll jfc error");
         return C_ERR;
     } else if (ret == 0) {
+        if (has_event) {
+            /* confirm the jfc events and re-arm, the order is mandatory */
+            nevents = polled;
+            urma_ack_jfc(ev_jfc, &nevents, 1);
+            if (urma_rearm_jfc(ctx->jfc, false)) {
+                serverLog(LL_WARNING, "RDMA: rearm jfc error");
+                return C_ERR;
+            }
+        }
         return C_OK;
     }
 
-    ibv_ack_cq_events(ctx->cq, 1);
+    polled++;
 
-    if (wc.status != IBV_WC_SUCCESS) {
+    if (cr.status != URMA_CR_SUCCESS) {
         if (rdma_conn->c.state == CONN_STATE_CONNECTED) {
-            serverLog(LL_WARNING, "RDMA: CQ handle error status: %s[0x%x], opcode : 0x%x", ibv_wc_status_str(wc.status),
-                      wc.status, wc.opcode);
+            serverLog(LL_WARNING, "RDMA: CQ handle error status: %d, opcode : 0x%x", cr.status, cr.opcode);
         }
         return C_ERR;
     }
 
-    switch (wc.opcode) {
-    case IBV_WC_RECV:
-        cmd = (ValkeyRdmaCmd *)wc.wr_id;
-        if (connRdmaHandleRecv(ctx, cm_id, cmd, wc.byte_len) == C_ERR) {
-            return C_ERR;
+    if (cr.flag.bs.s_r == 1) { /* receive side */
+        switch (cr.opcode) {
+        case URMA_CR_OPC_SEND:
+        case URMA_CR_OPC_SEND_WITH_IMM:
+            if (connRdmaHandleRecv(ctx, (ValkeyRdmaCmd *)(uintptr_t)cr.user_ctx, cr.completion_len) == C_ERR) {
+                return C_ERR;
+            }
+            break;
+
+        case URMA_CR_OPC_WRITE_WITH_IMM:
+            if (connRdmaHandleRecvImm(ctx, cr.completion_len) == C_ERR) {
+                rdma_conn->c.state = CONN_STATE_ERROR;
+                return C_ERR;
+            }
+
+            break;
+        default: serverLog(LL_WARNING, "RDMA: unexpected recv opcode 0x[%x]", cr.opcode); return C_ERR;
         }
-        break;
+    } else { /* send side */
+        switch (cr.opcode) {
+        case URMA_CR_OPC_SEND:
+        case URMA_CR_OPC_SEND_WITH_IMM:
+            if (connRdmaHandleSend((ValkeyRdmaCmd *)(uintptr_t)cr.user_ctx) == C_ERR) {
+                return C_ERR;
+            }
 
-    case IBV_WC_RECV_RDMA_WITH_IMM:
-        cmd = (ValkeyRdmaCmd *)wc.wr_id;
-        if (connRdmaHandleRecvImm(ctx, cm_id, cmd, ntohl(wc.imm_data)) == C_ERR) {
-            rdma_conn->c.state = CONN_STATE_ERROR;
-            return C_ERR;
+            break;
+
+        case URMA_CR_OPC_WRITE_WITH_IMM:
+            if (connRdmaHandleWrite(ctx, cr.completion_len) == C_ERR) {
+                return C_ERR;
+            }
+
+            break;
+
+        default: break;
         }
-
-        break;
-    case IBV_WC_RDMA_WRITE:
-        if (connRdmaHandleWrite(ctx, wc.byte_len) == C_ERR) {
-            return C_ERR;
-        }
-
-        break;
-
-    case IBV_WC_SEND:
-        cmd = (ValkeyRdmaCmd *)wc.wr_id;
-        if (connRdmaHandleSend(cmd) == C_ERR) {
-            return C_ERR;
-        }
-
-        break;
-
-    default: serverLog(LL_WARNING, "RDMA: unexpected opcode 0x[%x]", wc.opcode); return C_ERR;
     }
 
     goto pollcq;
@@ -640,9 +792,7 @@ pollcq:
 
 static int connRdmaAccept(connection *conn, ConnectionCallbackFunc accept_handler) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
-    struct ibv_device_attr device_attr;
+    RdmaContext *ctx = rdma_conn->ctx;
     int ret = C_OK;
 
     if (conn->state != CONN_STATE_ACCEPTING) return C_ERR;
@@ -653,12 +803,7 @@ static int connRdmaAccept(connection *conn, ConnectionCallbackFunc accept_handle
     if (!callHandler(conn, accept_handler)) ret = C_ERR;
     connDecrRefs(conn);
 
-    if (ibv_query_device(cm_id->verbs, &device_attr)) {
-        serverLog(LL_WARNING, "RDMA: ibv ibv query device failed");
-        return C_ERR;
-    }
-
-    conn->iovcnt = min(device_attr.max_sge, IOV_MAX);
+    conn->iovcnt = min(ctx->max_sge, IOV_MAX);
     ctx->conn = conn; /* save conn into RdmaContext */
 
     return ret;
@@ -668,6 +813,7 @@ static connection *connCreateRdma(void) {
     rdma_connection *rdma_conn = zcalloc(sizeof(rdma_connection));
     rdma_conn->c.type = &CT_RDMA;
     rdma_conn->c.fd = -1;
+    rdma_conn->cfd = -1;
     rdma_conn->c.iovcnt = 1; /* at least 1, overwrite this on connect */
 
     return (connection *)rdma_conn;
@@ -676,19 +822,147 @@ static connection *connCreateRdma(void) {
 static connection *connCreateAcceptedRdma(int fd, void *priv) {
     rdma_connection *rdma_conn = (rdma_connection *)connCreateRdma();
     rdma_conn->c.fd = fd;
+    rdma_conn->cfd = fd;
     rdma_conn->c.state = CONN_STATE_ACCEPTING;
-    rdma_conn->cm_id = priv;
-    /* The comp channel fd should be always non block */
+    rdma_conn->ctx = priv;
     connNonBlock(&rdma_conn->c);
 
     return (connection *)rdma_conn;
 }
 
+/* import the peer jetty and construct the RC transport channel */
+static int rdmaEstablish(RdmaContext *ctx) {
+    urma_token_t token = {.token = VALKEY_RDMA_JETTY_TOKEN};
+
+    ctx->tjetty = urma_import_jetty(ctx->uctx, &ctx->peer_rjetty, &token);
+    if (!ctx->tjetty) {
+        serverLog(LL_WARNING, "RDMA: import peer jetty failed");
+        return C_ERR;
+    }
+
+    if (urma_bind_jetty(ctx->jetty, ctx->tjetty)) {
+        serverLog(LL_WARNING, "RDMA: bind jetty failed");
+        return C_ERR;
+    }
+    ctx->bound = 1;
+
+    return C_OK;
+}
+
+static void rdmaSetEstablished(aeEventLoop *el, rdma_connection *rdma_conn) {
+    connection *conn = &rdma_conn->c;
+    RdmaContext *ctx = rdma_conn->ctx;
+
+    /* the TCP channel is not needed anymore */
+    if (rdma_conn->cfd != -1) {
+        aeDeleteFileEvent(server.el, rdma_conn->cfd, AE_READABLE | AE_WRITABLE);
+        close(rdma_conn->cfd);
+        rdma_conn->cfd = -1;
+    }
+
+    ctx->hs_state = HS_ESTABLISHED;
+    conn->fd = ctx->jfce->fd;
+    if (aeCreateFileEvent(server.el, conn->fd, AE_READABLE, conn->type->ae_handler, conn) == AE_ERR) {
+        conn->state = CONN_STATE_ERROR;
+        return;
+    }
+
+    connRdmaRegisterRx(ctx);
+
+    if (conn->state == CONN_STATE_CONNECTED && conn->conn_handler && ctx->conn == conn) {
+        /* client side: kick the connect handler */
+        callHandler(conn, conn->conn_handler);
+    }
+    UNUSED(el);
+}
+
+/* drive the out-of-band TCP handshake, works for both client and server side */
+static void connRdmaTcpProcess(aeEventLoop *el, rdma_connection *rdma_conn) {
+    connection *conn = &rdma_conn->c;
+    RdmaContext *ctx = rdma_conn->ctx;
+    char *buf = (char *)&ctx->peer_rjetty;
+    ssize_t n;
+
+    if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) return;
+
+    if (ctx->hs_state == HS_NONE) {
+        /* check whether the TCP connect has completed */
+        int so_error = 0;
+        socklen_t len = sizeof(so_error);
+
+        if (getsockopt(rdma_conn->cfd, SOL_SOCKET, SO_ERROR, &so_error, &len) < 0 || so_error) {
+            serverLog(LL_WARNING, "RDMA: tcp connect failed: %s", strerror(so_error ? so_error : errno));
+            conn->state = CONN_STATE_ERROR;
+            conn->last_errno = so_error ? so_error : ENETUNREACH;
+            if (conn->conn_handler) callHandler(conn, conn->conn_handler);
+            return;
+        }
+        ctx->hs_state = HS_LOCAL_SENT; /* reuse the state, our rjetty follows below */
+    }
+
+    /* send local rjetty */
+    while (ctx->hs_sent < sizeof(urma_rjetty_t)) {
+        n = write(rdma_conn->cfd, (char *)&ctx->local_rjetty + ctx->hs_sent, sizeof(urma_rjetty_t) - ctx->hs_sent);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            serverLog(LL_WARNING, "RDMA: send rjetty failed: %s", strerror(errno));
+            goto tcp_fail;
+        }
+        ctx->hs_sent += n;
+    }
+
+    /* receive peer rjetty */
+    while (ctx->hs_got < sizeof(urma_rjetty_t)) {
+        n = read(rdma_conn->cfd, buf + ctx->hs_got, sizeof(urma_rjetty_t) - ctx->hs_got);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            serverLog(LL_WARNING, "RDMA: recv rjetty failed: %s", strerror(errno));
+            goto tcp_fail;
+        }
+        if (n == 0) {
+            serverLog(LL_WARNING, "RDMA: peer closed the TCP channel during handshake");
+            goto tcp_fail;
+        }
+        ctx->hs_got += n;
+    }
+
+    if (ctx->hs_state != HS_ESTABLISHED) {
+        if (rdmaEstablish(ctx) == C_ERR) {
+            goto tcp_fail;
+        }
+
+        rdmaSetEstablished(el, rdma_conn);
+    }
+
+    return;
+
+tcp_fail:
+    conn->state = CONN_STATE_ERROR;
+    conn->last_errno = ECONNRESET;
+    if (conn->conn_handler && ctx->conn == conn) {
+        /* client side: notify the connect handler directly */
+        callHandler(conn, conn->conn_handler);
+    } else {
+        /* server side: no connect handler, schedule the close via pending
+         * list, otherwise the TCP channel stays readable forever and burns
+         * the event loop */
+        rdmaHandleDisconnect(el, ctx);
+    }
+}
+
+static void connRdmaTcpEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
+    rdma_connection *rdma_conn = (rdma_connection *)clientData;
+
+    UNUSED(fd);
+    UNUSED(mask);
+
+    connRdmaTcpProcess(el, rdma_conn);
+}
+
 static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
     rdma_connection *rdma_conn = (rdma_connection *)clientData;
     connection *conn = &rdma_conn->c;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
     int ret = 0;
 
     UNUSED(el);
@@ -697,7 +971,7 @@ static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientDat
 
     ret = connRdmaHandleCq(rdma_conn);
     if (ret == C_ERR) {
-        conn->state = CONN_STATE_ERROR;
+        rdmaHandleDisconnect(server.el, ctx);
         return;
     }
 
@@ -710,7 +984,7 @@ static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientDat
 
     /* recv buf is full, register a new RX buffer */
     if (ctx->rx.pos == ctx->rx.length) {
-        connRdmaRegisterRx(ctx, cm_id);
+        connRdmaRegisterRx(ctx);
     }
 
     /* RDMA comp channel has no POLLOUT event, try to send remaining buffer */
@@ -720,74 +994,73 @@ static void connRdmaEventHandler(struct aeEventLoop *el, int fd, void *clientDat
 }
 
 static int rdmaKeepaliveTimeProc(struct aeEventLoop *el, long long id, void *clientData) {
-    struct rdma_cm_id *cm_id = clientData;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = clientData;
     connection *conn = ctx->conn;
     ValkeyRdmaCmd cmd = {0};
 
     UNUSED(el);
     UNUSED(id);
-    if (conn->state != CONN_STATE_CONNECTED) {
+    if (!conn || conn->state != CONN_STATE_CONNECTED) {
         return AE_NOMORE;
     }
 
     cmd.keepalive.opcode = htons(Keepalive);
-    if (rdmaSendCommand(ctx, cm_id, &cmd) != C_OK) {
+    if (rdmaSendCommand(ctx, &cmd) != C_OK) {
         return AE_NOMORE;
     }
 
     return VALKEY_RDMA_KEEPALIVE_MS;
 }
 
-static int rdmaHandleConnect(aeEventLoop *el, char *err, struct rdma_cm_event *ev, char *ip, size_t ip_len, int *port) {
-    int ret = C_OK;
-    struct rdma_cm_id *cm_id = ev->id;
-    struct sockaddr_storage caddr;
+/* listener side: a new TCP connection means a new RDMA connection request */
+static int rdmaHandleConnect(aeEventLoop *el, char *err, int cfd, char *ip, size_t ip_len, int *port, void **priv) {
     RdmaContext *ctx = NULL;
-    struct rdma_conn_param conn_param = {
-        .responder_resources = 1,
-        .initiator_depth = 1,
-        .retry_count = 5,
-    };
 
-    memcpy(&caddr, &cm_id->route.addr.dst_addr, sizeof(caddr));
-    if (caddr.ss_family == AF_INET) {
-        struct sockaddr_in *s = (struct sockaddr_in *)&caddr;
-        if (ip) inet_ntop(AF_INET, (void *)&(s->sin_addr), ip, ip_len);
-        if (port) *port = ntohs(s->sin_port);
-    } else {
-        struct sockaddr_in6 *s = (struct sockaddr_in6 *)&caddr;
-        if (ip) inet_ntop(AF_INET6, (void *)&(s->sin6_addr), ip, ip_len);
-        if (port) *port = ntohs(s->sin6_port);
-    }
+    UNUSED(ip_len);
+    UNUSED(err);
 
     ctx = zcalloc(sizeof(RdmaContext));
     ctx->ip = zstrdup(ip);
     ctx->port = *port;
-    ctx->keepalive_te = aeCreateTimeEvent(el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, cm_id, NULL);
-    if (ctx->keepalive_te == AE_ERR) {
-        return C_ERR;
-    }
+    ctx->keepalive_te = AE_ERR;
+    ctx->hs_state = HS_NONE;
 
-    cm_id->context = ctx;
-    if (rdmaCreateResource(ctx, cm_id) == C_ERR) {
-        goto reject;
-    }
-
-    ret = rdma_accept(cm_id, &conn_param);
-    if (ret) {
-        serverRdmaError(err, "RDMA: accept failed");
+    if (rdmaCreateResource(ctx) == C_ERR) {
         goto free_rdma;
     }
 
+    /* capture local address of the TCP channel */
+    {
+        struct sockaddr_storage laddr;
+        socklen_t llen = sizeof(laddr);
+        char lip[NET_IP_STR_LEN] = {0};
+
+        if (!getsockname(cfd, (struct sockaddr *)&laddr, &llen)) {
+            if (laddr.ss_family == AF_INET) {
+                inet_ntop(AF_INET, &((struct sockaddr_in *)&laddr)->sin_addr, lip, sizeof(lip));
+                ctx->lport = ntohs(((struct sockaddr_in *)&laddr)->sin_port);
+            } else {
+                inet_ntop(AF_INET6, &((struct sockaddr_in6 *)&laddr)->sin6_addr, lip, sizeof(lip));
+                ctx->lport = ntohs(((struct sockaddr_in6 *)&laddr)->sin6_port);
+            }
+            ctx->lip = zstrdup(lip);
+        }
+    }
+
+    ctx->keepalive_te = aeCreateTimeEvent(el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, ctx, NULL);
+    if (ctx->keepalive_te == AE_ERR) {
+        goto free_rdma;
+    }
+
+    *priv = ctx;
+    UNUSED(err);
     return C_OK;
 
 free_rdma:
     rdmaReleaseResource(ctx);
-reject:
-    /* reject connect request if hitting error */
-    rdma_reject(cm_id, NULL, 0);
-
+    if (ctx->ip) zfree(ctx->ip);
+    if (ctx->lip) zfree(ctx->lip);
+    zfree(ctx);
     return C_ERR;
 }
 
@@ -802,68 +1075,32 @@ static rdma_listener *rdmaFdToListener(connListener *listener, int fd) {
 }
 
 /*
- * rdmaAccept, actually it works as cm-event handler for listen cm_id.
- * accept a connection logic works in two steps:
- * 1, handle RDMA_CM_EVENT_CONNECT_REQUEST and return CM fd on success
- * 2, handle RDMA_CM_EVENT_ESTABLISHED and return C_OK on success
+ * rdmaAccept, actually it works as accept handler for the listening socket.
+ * A new TCP connection stands for a RDMA connection request, create URMA
+ * resources and start the jetty exchange over this TCP channel.
  */
 static int
 rdmaAccept(aeEventLoop *el, connListener *listener, char *err, int fd, char *ip, size_t ip_len, int *port, void **priv) {
-    struct rdma_cm_event *ev;
-    enum rdma_cm_event_type ev_type;
     int ret = C_OK;
     rdma_listener *rdma_listener;
+
+    UNUSED(el);
 
     rdma_listener = rdmaFdToListener(listener, fd);
     if (!rdma_listener) {
         serverPanic("RDMA: unexpected listen file descriptor");
     }
 
-    ret = rdma_get_cm_event(rdma_listener->cm_channel, &ev);
-    if (ret) {
-        if (errno != EAGAIN) {
-            serverLog(LL_WARNING, "RDMA: listen channel rdma_get_cm_event failed, %s", strerror(errno));
-            return ANET_ERR;
+    ret = anetTcpAccept(err, fd, ip, ip_len, port);
+    if (ret == ANET_ERR) {
+        if (errno != EWOULDBLOCK) {
+            serverLog(LL_WARNING, "RDMA: accepting client connection failed, %s", strerror(errno));
         }
-        return ANET_OK;
+        return ANET_ERR;
     }
 
-    ev_type = ev->event;
-    switch (ev_type) {
-    case RDMA_CM_EVENT_CONNECT_REQUEST:
-        ret = rdmaHandleConnect(el, err, ev, ip, ip_len, port);
-        if (ret == C_OK) {
-            RdmaContext *ctx = (RdmaContext *)ev->id->context;
-            *priv = ev->id;
-            ret = ctx->comp_channel->fd;
-        }
-        break;
-
-    case RDMA_CM_EVENT_ESTABLISHED: ret = rdmaHandleEstablished(ev); break;
-
-    case RDMA_CM_EVENT_UNREACHABLE:
-    case RDMA_CM_EVENT_ADDR_ERROR:
-    case RDMA_CM_EVENT_ROUTE_ERROR:
-    case RDMA_CM_EVENT_CONNECT_ERROR:
-    case RDMA_CM_EVENT_REJECTED:
-    case RDMA_CM_EVENT_ADDR_CHANGE:
-    case RDMA_CM_EVENT_DISCONNECTED:
-    case RDMA_CM_EVENT_TIMEWAIT_EXIT:
-        rdmaHandleDisconnect(el, ev);
-        ret = C_OK;
-        break;
-
-    case RDMA_CM_EVENT_MULTICAST_JOIN:
-    case RDMA_CM_EVENT_MULTICAST_ERROR:
-    case RDMA_CM_EVENT_DEVICE_REMOVAL:
-    case RDMA_CM_EVENT_ADDR_RESOLVED:
-    case RDMA_CM_EVENT_ROUTE_RESOLVED:
-    case RDMA_CM_EVENT_CONNECT_RESPONSE:
-    default: serverLog(LL_NOTICE, "RDMA: listen channel ignore event: %s", rdma_event_str(ev_type)); break;
-    }
-
-    if (rdma_ack_cm_event(ev)) {
-        serverLog(LL_WARNING, "ack cm event failed\n");
+    if (rdmaHandleConnect(el, err, ret, ip, ip_len, port, priv) == C_ERR) {
+        close(ret);
         return ANET_ERR;
     }
 
@@ -872,7 +1109,7 @@ rdmaAccept(aeEventLoop *el, connListener *listener, char *err, int fd, char *ip,
 
 static void connRdmaAcceptHandler(aeEventLoop *el, int fd, void *privdata, int mask) {
     int cport = 0, cfd, max = 1000;
-    int flags = 0;    
+    int flags = 0;
     char cip[NET_IP_STR_LEN];
     void *connpriv = NULL;
     connListener *listener = (connListener *)privdata;
@@ -884,13 +1121,25 @@ static void connRdmaAcceptHandler(aeEventLoop *el, int fd, void *privdata, int m
         if (cfd == ANET_ERR) {
             if (errno != EWOULDBLOCK) serverLog(LL_WARNING, "RDMA Accepting client connection: %s", server.neterr);
             return;
-        } else if (cfd == ANET_OK)
-            continue;
+        }
 
         connection *conn = connCreateAcceptedRdma(cfd, connpriv);
         if (!conn) {
             serverLog(LL_WARNING, "[RDMA] connCreateAcceptedRdma returned NULL! Skipping connection from %s:%d", cip, cport);
+            RdmaContext *ctx = connpriv;
+            rdmaReleaseResource(ctx);
+            if (ctx->ip) zfree(ctx->ip);
+            if (ctx->lip) zfree(ctx->lip);
+            zfree(ctx);
             close(cfd); // Avoid leaking open file descriptors
+            continue;
+        }
+        anetNonBlock(NULL, cfd);
+        anetCloexec(cfd);
+        /* drive the jetty exchange over the TCP channel */
+        if (aeCreateFileEvent(server.el, cfd, AE_READABLE | AE_WRITABLE, connRdmaTcpEventHandler, conn) == AE_ERR) {
+            serverLog(LL_WARNING, "[RDMA] register TCP handshake event failed for %s:%d", cip, cport);
+            close(cfd);
             continue;
         }
         acceptCommonHandler(conn, flags, cip);
@@ -926,8 +1175,10 @@ static int connRdmaSetWriteHandler(connection *conn, ConnectionCallbackFunc func
 
     /* does this connection has pending write data? */
     if (func) {
-        listAddNodeTail(pending_list, conn);
-        rdma_conn->pending_list_node = listLast(pending_list);
+        if (!rdma_conn->pending_list_node) {
+            listAddNodeTail(pending_list, conn);
+            rdma_conn->pending_list_node = listLast(pending_list);
+        }
     } else if (rdma_conn->pending_list_node) {
         listDelNode(pending_list, rdma_conn->pending_list_node);
         rdma_conn->pending_list_node = NULL;
@@ -953,109 +1204,8 @@ static inline void rdmaConnectFailed(rdma_connection *rdma_conn) {
     conn->last_errno = ENETUNREACH;
 }
 
-static int rdmaConnect(RdmaContext *ctx, struct rdma_cm_id *cm_id) {
-    struct rdma_conn_param conn_param = {0};
-
-    if (rdmaCreateResource(ctx, cm_id) == C_ERR) {
-        return C_ERR;
-    }
-
-    /* rdma connect with param */
-    conn_param.responder_resources = 1;
-    conn_param.initiator_depth = 1;
-    conn_param.retry_count = 7;
-    conn_param.rnr_retry_count = 7;
-    if (rdma_connect(cm_id, &conn_param)) {
-        return C_ERR;
-    }
-
-    anetNonBlock(NULL, ctx->comp_channel->fd);
-    anetCloexec(ctx->comp_channel->fd);
-
-    return C_OK;
-}
-
-/* TODO: rdmaAccept also deals with RDMA event, server side has different logic with client side, maybe we can merge
- * this CM logic in future */
-static void rdmaCMeventHandler(struct aeEventLoop *el, int fd, void *clientData, int mask) {
-    rdma_connection *rdma_conn = (rdma_connection *)clientData;
-    connection *conn = &rdma_conn->c;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
-    struct rdma_event_channel *cm_channel = ctx->cm_channel;
-    struct rdma_cm_event *ev;
-    enum rdma_cm_event_type ev_type;
-    int ret = C_OK;
-
-    UNUSED(el);
-    UNUSED(fd);
-    UNUSED(mask);
-
-    ret = rdma_get_cm_event(cm_channel, &ev);
-    if (ret) {
-        if (errno != EAGAIN) {
-            serverLog(LL_WARNING, "RDMA: client channel rdma_get_cm_event failed, %s", strerror(errno));
-        }
-        return;
-    }
-
-    ev_type = ev->event;
-    switch (ev_type) {
-    case RDMA_CM_EVENT_ADDR_RESOLVED:
-        /* resolve route at most 100ms */
-        if (rdma_resolve_route(ev->id, 100)) {
-            rdmaConnectFailed(rdma_conn);
-        }
-        break;
-
-    case RDMA_CM_EVENT_ROUTE_RESOLVED:
-        if (rdmaConnect(ctx, ev->id) == C_ERR) {
-            rdmaConnectFailed(rdma_conn);
-        }
-        break;
-
-    case RDMA_CM_EVENT_ESTABLISHED:
-        rdmaHandleEstablished(ev);
-        conn->state = CONN_STATE_CONNECTED;
-        conn->fd = ctx->comp_channel->fd;
-        if (conn->conn_handler) {
-            callHandler(conn, conn->conn_handler);
-        }
-        break;
-
-    case RDMA_CM_EVENT_UNREACHABLE:
-    case RDMA_CM_EVENT_ROUTE_ERROR:
-    case RDMA_CM_EVENT_ADDR_ERROR:
-    case RDMA_CM_EVENT_REJECTED: rdmaConnectFailed(rdma_conn); break;
-
-    case RDMA_CM_EVENT_CONNECT_ERROR:
-    case RDMA_CM_EVENT_TIMEWAIT_EXIT:
-    case RDMA_CM_EVENT_CONNECT_REQUEST:
-    case RDMA_CM_EVENT_ADDR_CHANGE:
-    case RDMA_CM_EVENT_DISCONNECTED: rdmaHandleDisconnect(el, ev); break;
-
-    case RDMA_CM_EVENT_MULTICAST_JOIN:
-    case RDMA_CM_EVENT_MULTICAST_ERROR:
-    case RDMA_CM_EVENT_DEVICE_REMOVAL:
-    case RDMA_CM_EVENT_CONNECT_RESPONSE:
-    default: serverLog(LL_NOTICE, "RDMA: client channel ignore event: %s", rdma_event_str(ev_type));
-    }
-
-    if (rdma_ack_cm_event(ev)) {
-        serverLog(LL_NOTICE, "RDMA: ack cm event failed\n");
-    }
-
-    /* connection error or closed by remote peer */
-    if (conn->state == CONN_STATE_ERROR) {
-        callHandler(conn, conn->conn_handler);
-    }
-}
-
-/* free resource during connection close */
 static int rdmaResolveAddr(rdma_connection *rdma_conn, const char *addr, int port, const char *src_addr) {
     struct addrinfo hints, *servinfo = NULL, *p = NULL;
-    struct rdma_event_channel *cm_channel = NULL;
-    struct rdma_cm_id *cm_id = NULL;
     RdmaContext *ctx = NULL;
     struct sockaddr_storage saddr;
     char _port[6]; /* strlen("65535") */
@@ -1068,25 +1218,12 @@ static int rdmaResolveAddr(rdma_connection *rdma_conn, const char *addr, int por
         serverLog(LL_WARNING, "RDMA: Out of memory");
         goto out;
     }
+    ctx->port = port;
+    ctx->keepalive_te = AE_ERR;
+    ctx->hs_state = HS_NONE;
+    rdma_conn->ctx = ctx;
 
-    cm_channel = rdma_create_event_channel();
-    if (!cm_channel) {
-        serverLog(LL_WARNING, "RDMA: create event channel failed");
-        goto out;
-    }
-    ctx->cm_channel = cm_channel;
-
-    if (rdma_create_id(cm_channel, &cm_id, (void *)ctx, RDMA_PS_TCP)) {
-        serverLog(LL_WARNING, "RDMA: create id failed");
-        goto out;
-    }
-    rdma_conn->cm_id = cm_id;
-
-    if (anetNonBlock(NULL, cm_channel->fd) != C_OK) {
-        serverLog(LL_WARNING, "RDMA: set cm channel fd non-block failed");
-        goto out;
-    }
-
+    /* create the out-of-band TCP channel */
     snprintf(_port, 6, "%d", port);
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
@@ -1101,28 +1238,45 @@ static int rdmaResolveAddr(rdma_connection *rdma_conn, const char *addr, int por
     }
 
     for (p = servinfo; p != NULL; p = p->ai_next) {
-        if (p->ai_family == PF_INET) {
-            memcpy(&saddr, p->ai_addr, sizeof(struct sockaddr_in));
-            ((struct sockaddr_in *)&saddr)->sin_port = htons(port);
-        } else if (p->ai_family == PF_INET6) {
-            memcpy(&saddr, p->ai_addr, sizeof(struct sockaddr_in6));
-            ((struct sockaddr_in6 *)&saddr)->sin6_port = htons(port);
-        } else {
+        if (p->ai_family != PF_INET && p->ai_family != PF_INET6) {
             serverLog(LL_WARNING, "RDMA: Unsupported family");
-            goto out;
-        }
-
-        /* resolve addr at most 100ms */
-        if (rdma_resolve_addr(cm_id, NULL, (struct sockaddr *)&saddr, 100)) {
             continue;
         }
+
+        memcpy(&saddr, p->ai_addr, p->ai_addrlen);
+        if (p->ai_family == PF_INET) {
+            ((struct sockaddr_in *)&saddr)->sin_port = htons(port);
+        } else {
+            ((struct sockaddr_in6 *)&saddr)->sin6_port = htons(port);
+        }
+
+        rdma_conn->cfd = socket(p->ai_family, SOCK_STREAM, 0);
+        if (rdma_conn->cfd < 0) {
+            continue;
+        }
+        anetNonBlock(NULL, rdma_conn->cfd);
+        anetCloexec(rdma_conn->cfd);
+        if (connect(rdma_conn->cfd, (struct sockaddr *)&saddr, p->ai_addrlen) < 0 && errno != EINPROGRESS) {
+            close(rdma_conn->cfd);
+            rdma_conn->cfd = -1;
+            continue;
+        }
+
+        ctx->ip = zstrdup(addr);
         availableAddrs++;
+        break;
     }
 
     if (!availableAddrs) {
         serverLog(LL_WARNING, "RDMA: server addr not available");
         goto out;
     }
+
+    if (rdmaCreateResource(ctx) == C_ERR) {
+        goto out;
+    }
+
+    ctx->keepalive_te = aeCreateTimeEvent(server.el, VALKEY_RDMA_KEEPALIVE_MS, rdmaKeepaliveTimeProc, ctx, NULL);
 
     ret = C_OK;
 
@@ -1136,10 +1290,28 @@ out:
 
 static int connRdmaWait(connection *conn, long start, long timeout) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
+    RdmaContext *ctx = rdma_conn->ctx;
     long long remaining = timeout, wait, elapsed = 0;
+    int mask;
 
     remaining = timeout - elapsed;
     wait = (remaining < VALKEY_RDMA_SYNCIO_RES) ? remaining : VALKEY_RDMA_SYNCIO_RES;
+
+    if (ctx->hs_state != HS_ESTABLISHED && rdma_conn->cfd != -1) {
+        /* still in the TCP handshake phase */
+        mask = aeWait(rdma_conn->cfd, AE_READABLE | AE_WRITABLE, wait);
+        elapsed = mstime() - start;
+        if (elapsed >= timeout) {
+            errno = ETIMEDOUT;
+            return C_ERR;
+        }
+        if (mask & (AE_READABLE | AE_WRITABLE)) {
+            connRdmaTcpProcess(server.el, rdma_conn);
+            if (conn->state == CONN_STATE_ERROR) return C_ERR;
+        }
+        return C_OK;
+    }
+
     aeWait(conn->fd, AE_READABLE, wait);
     elapsed = mstime() - start;
     if (elapsed >= timeout) {
@@ -1161,16 +1333,16 @@ static int connRdmaConnect(connection *conn,
                            const char *src_addr,
                            ConnectionCallbackFunc connect_handler) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id;
     RdmaContext *ctx;
 
     if (rdmaResolveAddr(rdma_conn, addr, port, src_addr) == C_ERR) {
         return C_ERR;
     }
 
-    cm_id = rdma_conn->cm_id;
-    ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
+    ctx = rdma_conn->ctx;
+    ctx->conn = conn;
+    if (aeCreateFileEvent(server.el, rdma_conn->cfd, AE_READABLE | AE_WRITABLE, connRdmaTcpEventHandler, conn) ==
+        AE_ERR) {
         return C_ERR;
     }
 
@@ -1181,7 +1353,6 @@ static int connRdmaConnect(connection *conn,
 
 static int connRdmaBlockingConnect(connection *conn, const char *addr, int port, long long timeout) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id;
     RdmaContext *ctx;
     long long start = mstime();
 
@@ -1189,11 +1360,9 @@ static int connRdmaBlockingConnect(connection *conn, const char *addr, int port,
         return C_ERR;
     }
 
-    cm_id = rdma_conn->cm_id;
-    ctx = cm_id->context;
-    if (aeCreateFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE, rdmaCMeventHandler, conn) == AE_ERR) {
-        return C_ERR;
-    }
+    ctx = rdma_conn->ctx;
+    ctx->conn = conn;
+    conn->conn_handler = NULL;
 
     do {
         if (connRdmaWait(conn, start, timeout) == C_ERR) {
@@ -1210,7 +1379,6 @@ static void connRdmaShutdown(connection *conn) {
 
 static void connRdmaClose(connection *conn) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
     RdmaContext *ctx;
 
     if (conn->fd != -1) {
@@ -1226,63 +1394,81 @@ static void connRdmaClose(connection *conn) {
         return;
     }
 
-    if (!cm_id) {
+    ctx = rdma_conn->ctx;
+    if (!ctx) {
+        if (rdma_conn->cfd != -1) close(rdma_conn->cfd);
+        zfree(conn);
         return;
     }
 
-    ctx = cm_id->context;
     rdmaDelKeepalive(server.el, ctx);
-    rdma_disconnect(cm_id);
 
-    /* poll all CQ before close */
-    connRdmaHandleCq(rdma_conn);
+    /* poll all CR before close */
+    if (ctx->hs_state == HS_ESTABLISHED && connRdmaAllowCommand() == C_OK) {
+        connRdmaHandleCq(rdma_conn);
+    }
+
+    if (rdma_conn->cfd != -1) {
+        aeDeleteFileEvent(server.el, rdma_conn->cfd, AE_READABLE | AE_WRITABLE);
+        close(rdma_conn->cfd);
+        rdma_conn->cfd = -1;
+    }
+
     rdmaReleaseResource(ctx);
-    if (cm_id->qp) {
-        ibv_destroy_qp(cm_id->qp);
-    }
 
-    rdma_destroy_id(cm_id);
-    if (ctx->cm_channel) {
-        aeDeleteFileEvent(server.el, ctx->cm_channel->fd, AE_READABLE);
-        rdma_destroy_event_channel(ctx->cm_channel);
-    }
-
-    rdma_conn->cm_id = NULL;
+    if (ctx->ip) zfree(ctx->ip);
+    if (ctx->lip) zfree(ctx->lip);
     zfree(ctx);
+    rdma_conn->ctx = NULL;
     zfree(conn);
 }
 
 static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
-    struct ibv_send_wr send_wr, *bad_wr;
-    struct ibv_sge sge;
+    RdmaContext *ctx = rdma_conn->ctx;
+    urma_jfs_wr_t wr = {0};
+    urma_sge_t sge, dsge;
+    urma_jfs_wr_t *bad_wr;
     uint32_t off = ctx->tx.offset;
     char *addr = ctx->tx.addr + off;
-    char *remote_addr = ctx->tx_addr + ctx->tx.offset;
+    uint64_t remote_addr = ctx->tx_remote_addr + ctx->tx.offset;
     int ret;
 
     if (connRdmaAllowCommand()) {
         return C_ERR;
     }
 
+    if (!ctx->remote_rx_tseg || !ctx->tx_tseg) {
+        serverLog(LL_WARNING, "RDMA: FATAL error, remote rx buffer not registered");
+        return C_ERR;
+    }
+
     memcpy(addr, data, data_len);
 
     sge.addr = (uint64_t)addr;
-    sge.lkey = ctx->tx.mr->lkey;
-    sge.length = data_len;
+    sge.len = data_len;
+    sge.tseg = ctx->tx_tseg;
+    sge.user_tseg = NULL;
 
-    send_wr.sg_list = &sge;
-    send_wr.num_sge = 1;
-    send_wr.opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-    send_wr.send_flags = (++ctx->tx_ops % (VALKEY_RDMA_MAX_WQE / 2)) ? 0 : IBV_SEND_SIGNALED;
-    send_wr.imm_data = htonl(data_len);
-    send_wr.wr.rdma.remote_addr = (uint64_t)remote_addr;
-    send_wr.wr.rdma.rkey = ctx->tx_key;
-    send_wr.wr_id = 0;
-    send_wr.next = NULL;
-    ret = ibv_post_send(cm_id->qp, &send_wr, &bad_wr);
+    dsge.addr = remote_addr;
+    dsge.len = data_len;
+    dsge.tseg = ctx->remote_rx_tseg;
+    dsge.user_tseg = NULL;
+
+    wr.opcode = URMA_OPC_WRITE_IMM;
+    wr.tjetty = ctx->tjetty;
+    wr.user_ctx = 0;
+    /* signal the send completion periodically to release TX buffer space */
+    wr.flag.bs.complete_enable = (++ctx->tx_ops % (VALKEY_RDMA_MAX_WQE / 2)) ? 0 : 1;
+    wr.flag.bs.place_order = URMA_STRONG_ORDER;
+    wr.rw.src.sge = &sge;
+    wr.rw.src.num_sge = 1;
+    wr.rw.dst.sge = &dsge;
+    wr.rw.dst.num_sge = 1;
+    wr.rw.notify_data = data_len; /* immediate data in host byte order */
+    wr.next = NULL;
+
+    ret = urma_post_jetty_send_wr(ctx->jetty, &wr, &bad_wr);
     if (ret) {
         serverLog(LL_WARNING, "RDMA: post send failed: %d", ret);
         conn->state = CONN_STATE_ERROR;
@@ -1296,8 +1482,7 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
 
 static int connRdmaWrite(connection *conn, const void *data, size_t data_len) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
     uint32_t towrite;
 
     if (connRdmaAllowRW(conn)) {
@@ -1340,8 +1525,7 @@ static inline uint32_t rdmaRead(RdmaContext *ctx, void *buf, size_t buf_len) {
 
 static int connRdmaRead(connection *conn, void *buf, size_t buf_len) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
 
     if (connRdmaAllowRW(conn)) {
         return C_ERR;
@@ -1359,8 +1543,7 @@ static int connRdmaRead(connection *conn, void *buf, size_t buf_len) {
 
 static ssize_t connRdmaSyncWrite(connection *conn, char *ptr, ssize_t size, long long timeout) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
     ssize_t nwritten = 0;
     long long start = mstime();
     uint32_t towrite;
@@ -1380,7 +1563,7 @@ wait:
         return C_ERR;
     }
 
-    if (unlikely(!ctx->tx.mr)) {
+    if (unlikely(!ctx->tx_tseg)) {
         goto wait;
     }
 
@@ -1402,8 +1585,7 @@ copy:
 
 static ssize_t connRdmaSyncRead(connection *conn, char *ptr, ssize_t size, long long timeout) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
     ssize_t nread = 0;
     long long start = mstime();
     uint32_t toread;
@@ -1435,8 +1617,7 @@ copy:
 
 static ssize_t connRdmaSyncReadLine(connection *conn, char *ptr, ssize_t size, long long timeout) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    RdmaContext *ctx = cm_id->context;
+    RdmaContext *ctx = rdma_conn->ctx;
     ssize_t nread = 0;
     long long start = mstime();
     uint32_t toread;
@@ -1491,101 +1672,30 @@ static const char *connRdmaGetType(connection *conn) {
 }
 
 static int rdmaServer(char *err, int port, char *bindaddr, int af, rdma_listener *rdma_listener) {
-    int ret = ANET_OK, rv, afonly = 1;
-    char _port[6]; /* strlen("65535") */
-    struct addrinfo hints, *servinfo, *p;
-    struct sockaddr_storage sock_addr;
-    struct rdma_cm_id *listen_cmid = NULL;
-    struct rdma_event_channel *listen_channel = NULL;
+    int fd = ANET_ERR;
 
-    snprintf(_port, 6, "%d", port);
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = af;
-    hints.ai_socktype = SOCK_STREAM;
-    hints.ai_flags = AI_PASSIVE; /* No effect if bindaddr != NULL */
-    if (bindaddr && !strcmp("*", bindaddr)) bindaddr = NULL;
+    if (af == AF_INET6) {
+        fd = anetTcp6Server(err, port, bindaddr, 511);
+    } else {
+        fd = anetTcpServer(err, port, bindaddr, 511);
+    }
 
-    if (af == AF_INET6 && bindaddr && !strcmp("::*", bindaddr)) bindaddr = NULL;
-
-    if ((rv = getaddrinfo(bindaddr, _port, &hints, &servinfo)) != 0) {
-        serverRdmaError(err, "RDMA: %s", gai_strerror(rv));
+    if (fd == ANET_ERR) {
         return ANET_ERR;
-    } else if (!servinfo) {
-        serverRdmaError(err, "RDMA: get addr info failed");
-        ret = ANET_ERR;
-        goto end;
     }
 
-    listen_channel = rdma_create_event_channel();
-    if (!listen_channel) {
-        serverLog(LL_WARNING, "RDMA: create event channel failed");
-        goto error;
-    }
-
-    for (p = servinfo; p != NULL; p = p->ai_next) {
-        memset(&sock_addr, 0, sizeof(sock_addr));
-        if (p->ai_family == AF_INET6) {
-            memcpy(&sock_addr, p->ai_addr, sizeof(struct sockaddr_in6));
-            ((struct sockaddr_in6 *)&sock_addr)->sin6_family = AF_INET6;
-            ((struct sockaddr_in6 *)&sock_addr)->sin6_port = htons(port);
-        } else {
-            memcpy(&sock_addr, p->ai_addr, sizeof(struct sockaddr_in));
-            ((struct sockaddr_in *)&sock_addr)->sin_family = AF_INET;
-            ((struct sockaddr_in *)&sock_addr)->sin_port = htons(port);
-        }
-
-        if (rdma_create_id(listen_channel, &listen_cmid, NULL, RDMA_PS_TCP)) {
-            serverRdmaError(err, "RDMA: create listen cm id error");
-            return ANET_ERR;
-        }
-
-        rdma_set_option(listen_cmid, RDMA_OPTION_ID, RDMA_OPTION_ID_AFONLY, &afonly, sizeof(afonly));
-
-        if (rdma_bind_addr(listen_cmid, (struct sockaddr *)&sock_addr)) {
-            serverRdmaError(err, "RDMA: bind addr error");
-            goto error;
-        }
-
-        if (rdma_listen(listen_cmid, 0)) {
-            serverRdmaError(err, "RDMA: listen addr error");
-            goto error;
-        }
-
-        rdma_listener->cm_id = listen_cmid;
-        rdma_listener->cm_channel = listen_channel;
-        serverLog(LL_WARNING, "[RDMA] Calling rdmaServer on %s:%d", bindaddr, port);
-        ret = ANET_OK;
-        goto end;
-    }
-
-error:
-    if (listen_cmid) rdma_destroy_id(listen_cmid);
-    if (listen_channel) rdma_destroy_event_channel(listen_channel);
-    ret = ANET_ERR;
-
-end:
-    freeaddrinfo(servinfo);
-    return ret;
+    rdma_listener->fd = fd;
+    serverLog(LL_NOTICE, "[RDMA] urma transport listening on %s:%d", bindaddr ? bindaddr : "*", port);
+    return ANET_OK;
 }
 
 static int connRdmaIsLocal(connection *conn) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct sockaddr *laddr = rdma_get_local_addr(rdma_conn->cm_id);
-    struct sockaddr *raddr = rdma_get_peer_addr(rdma_conn->cm_id);
-    struct sockaddr_in *lsa4, *rsa4;
-    struct sockaddr_in6 *lsa6, *rsa6;
+    RdmaContext *ctx = rdma_conn->ctx;
 
-    if (laddr->sa_family == AF_INET) {
-        lsa4 = (struct sockaddr_in *)laddr;
-        rsa4 = (struct sockaddr_in *)raddr;
-        return !memcmp(&lsa4->sin_addr, &rsa4->sin_addr, sizeof(lsa4->sin_addr));
-    } else if (laddr->sa_family == AF_INET6) {
-        lsa6 = (struct sockaddr_in6 *)laddr;
-        rsa6 = (struct sockaddr_in6 *)raddr;
-        return !memcmp(&lsa6->sin6_addr, &rsa6->sin6_addr, sizeof(lsa6->sin6_addr));
-    }
+    if (!ctx || !ctx->lip || !ctx->ip) return -1;
 
-    return -1;
+    return !strcmp(ctx->lip, ctx->ip);
 }
 
 int connRdmaListen(connListener *listener) {
@@ -1593,7 +1703,6 @@ int connRdmaListen(connListener *listener) {
     char **bindaddr = listener->bindaddr;
     int bindaddr_count = listener->bindaddr_count;
     int port = listener->port;
-    char *default_bindaddr[2] = {"*", "-::*"};
     rdma_listener *rdma_listener;
 
     assert(server.proto_max_bulk_len <= 512ll * 1024 * 1024);
@@ -1625,7 +1734,7 @@ int connRdmaListen(connListener *listener) {
             return C_ERR;
         }
 
-        int fd = rdma_listener->cm_channel->fd;
+        int fd = rdma_listener->fd;
         anetNonBlock(NULL, fd);
         anetCloexec(fd);
         listener->fd[listener->count++] = fd;
@@ -1642,10 +1751,8 @@ static void connRdmaCloseListener(connListener *listener) {
         if (listener->fd[i] == -1) continue;
 
         aeDeleteFileEvent(server.el, listener->fd[i], AE_READABLE);
+        close(listener->fd[i]);
         listener->fd[i] = -1;
-        struct rdma_listener *rdma_listener = &rdma_listeners[i];
-        rdma_destroy_id(rdma_listener->cm_id);
-        rdma_destroy_event_channel(rdma_listener->cm_channel);
     }
 
     listener->count = 0;
@@ -1656,45 +1763,35 @@ static void connRdmaCloseListener(connListener *listener) {
 
 static int connRdmaAddr(connection *conn, char *ip, size_t ip_len, int *port, int remote) {
     rdma_connection *rdma_conn = (rdma_connection *)conn;
-    struct rdma_cm_id *cm_id = rdma_conn->cm_id;
-    struct sockaddr_storage *ss = NULL;
-    struct sockaddr_in *sa4;
-    struct sockaddr_in6 *sa6;
+    RdmaContext *ctx = rdma_conn->ctx;
+    const char *addr;
+    int rport;
 
-    if (remote)
-        ss = (struct sockaddr_storage *)rdma_get_peer_addr(cm_id);
-    else
-        ss = (struct sockaddr_storage *)rdma_get_local_addr(cm_id);
-
-    if (!ss) {
+    if (!ctx) {
         goto error;
     }
 
-    if (ss->ss_family == AF_INET) {
-        sa4 = (struct sockaddr_in *)ss;
-        if (ip) {
-            if (inet_ntop(AF_INET, (void *)&(sa4->sin_addr), ip, ip_len) == NULL) {
-                goto error;
-            }
-        }
-
-        if (port) {
-            *port = ntohs(sa4->sin_port);
-        }
-    } else if (ss->ss_family == AF_INET6) {
-        sa6 = (struct sockaddr_in6 *)ss;
-        if (ip) {
-            if (inet_ntop(AF_INET6, (void *)&(sa6->sin6_addr), ip, ip_len) == NULL) {
-                goto error;
-            }
-        }
-
-        if (port) {
-            *port = ntohs(sa6->sin6_port);
-        }
+    if (remote) {
+        addr = ctx->ip;
+        rport = ctx->port;
     } else {
-        /* TODO IB protocol */
+        addr = ctx->lip;
+        rport = ctx->lport;
+    }
+
+    if (!addr) {
         goto error;
+    }
+
+    if (ip) {
+        if (ip_len < strlen(addr) + 1) {
+            goto error;
+        }
+        memcpy(ip, addr, strlen(addr) + 1);
+    }
+
+    if (port) {
+        *port = rport;
     }
 
     return 0;
@@ -1717,13 +1814,13 @@ error:
 static void rdmaInit(void) {
     pending_list = listCreate();
 
-    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaFeature) != 32);
-    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaKeepalive) != 32);
-    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaMemory) != 32);
-    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaCmd) != 32);
+    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaFeature) != 64);
+    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaKeepalive) != 64);
+    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaMemory) != 64);
+    VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaCmd) != 64);
 
-    if (ibv_fork_init()) {
-        serverLog(LL_WARNING, "RDMA: FATAL error, ibv_fork_init failed");
+    if (urma_init(NULL)) {
+        serverLog(LL_WARNING, "RDMA: FATAL error, urma init failed");
     }
 }
 
@@ -1746,7 +1843,7 @@ static int rdmaProcessPendingData(void) {
         rdma_conn = listNodeValue(ln);
         conn = &rdma_conn->c;
 
-        /* a connection can be disconnected by remote peer, CM event mark state as CONN_STATE_CLOSED, kick connection
+        /* a connection can be disconnected by remote peer, error mark state as CONN_STATE_CLOSED, kick connection
          * read/write handler to close connection */
         if (conn->state == CONN_STATE_ERROR || conn->state == CONN_STATE_CLOSED) {
             listDelNode(pending_list, rdma_conn->pending_list_node);
@@ -1830,7 +1927,7 @@ int RegisterConnectionTypeRdma(void) {
 
 
 int RegisterConnectionTypeRdma(void) {
-    return connTypeRegister(&CT_RDMA);
+    return C_ERR;
 }
 
 #endif

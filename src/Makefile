@@ -307,17 +307,15 @@ ifeq ($(BUILD_TLS),module)
 endif
 
 
-RDMA_LIBS=
-RDMA_PKGCONFIG := $(shell $(PKG_CONFIG) --exists librdmacm libibverbs && echo $$?)
-ifeq ($(RDMA_PKGCONFIG),0)
-	RDMA_LIBS=$(shell $(PKG_CONFIG) --libs librdmacm libibverbs)
-else
-	RDMA_LIBS=-lrdmacm -libverbs
-endif
+# URMA (umdk) support: path to urma headers and libraries.
+# Override with e.g. make URMA_PATH=/opt/umdk
+URMA_PATH ?= /home/work/umdk-install
+URMA_CFLAGS=-I$(URMA_PATH)/include
+URMA_LIBS=-L$(URMA_PATH)/lib -lurma -lurma_common -Wl,-rpath,$(URMA_PATH)/lib,--disable-new-dtags
 
 ifeq ($(BUILD_RDMA),yes)
-	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_YES) -DBUILD_RDMA_MODULE=$(BUILD_NO)
-	FINAL_LIBS += $(RDMA_LIBS)
+	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_YES) -DBUILD_RDMA_MODULE=$(BUILD_NO) $(URMA_CFLAGS)
+	FINAL_LIBS += $(URMA_LIBS)
 endif
 
 RDMA_MODULE=
@@ -326,7 +324,7 @@ RDMA_MODULE_CFLAGS:=$(FINAL_CFLAGS)
 ifeq ($(BUILD_RDMA),module)
 	FINAL_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE)
 	RDMA_MODULE=$(RDMA_MODULE_NAME)
-	RDMA_MODULE_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) -DBUILD_RDMA_MODULE=$(BUILD_MODULE) $(RDMA_LIBS)
+	RDMA_MODULE_CFLAGS+=-DUSE_RDMA=$(BUILD_MODULE) -DBUILD_RDMA_MODULE=$(BUILD_MODULE) $(URMA_CFLAGS) $(URMA_LIBS)
 endif
 
 
@@ -380,7 +378,7 @@ ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_CLI_OBJ) $(RED
 
 ifeq ($(BUILD_RDMA),yes)
     REDIS_CFLAGS += -DBUILD_RDMA
-    REDIS_LDFLAGS += -lrdmacm -libverbs
+    REDIS_LDFLAGS += -L$(URMA_PATH)/lib -lurma -lurma_common -Wl,-rpath,$(URMA_PATH)/lib,--disable-new-dtags
     REDIS_SERVER_OBJ += rdma.o
 endif
 
