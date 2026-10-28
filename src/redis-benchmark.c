@@ -60,6 +60,7 @@
 #include "hdr_histogram.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "urma_client.h"
 
 #define UNUSED(V) ((void) V)
 #define RANDPTR_INITIAL_SIZE 8
@@ -84,6 +85,7 @@ static struct config {
     cliConnInfo conn_info;
     const char *hostsocket;
     int tls;
+    int urma; /* use the URMA (umdk) RDMA transport */
     struct cliSSLconfig sslconfig;
     int numclients;
     redisAtomic int liveclients;
@@ -270,6 +272,15 @@ static redisContext *getRedisContext(const char *ip, int port,
         else
             fprintf(stderr,"%s: %s\n",hostsocket,err);
         goto cleanup;
+    }
+    if (config.urma && hostsocket == NULL) {
+        if (redisUrmaUpgrade(ctx, 10000) != REDIS_OK) {
+            fprintf(stderr,"Could not establish URMA connection to Redis at %s:%d: %s\n",
+                    ip,port,ctx->errstr);
+            redisFree(ctx);
+            ctx = NULL;
+            goto cleanup;
+        }
     }
     if (config.tls==1) {
         const char *err = NULL;
@@ -695,6 +706,15 @@ static client createClient(char *cmd, size_t len, client from, int thread_id) {
         else
             fprintf(stderr,"%s: %s\n",config.hostsocket,c->context->errstr);
         exit(1);
+    }
+    if (config.urma && !is_cluster_client && config.hostsocket == NULL) {
+        /* upgrade the TCP channel to the URMA transport; this blocks until
+         * the server side finishes its half of the handshake */
+        if (redisUrmaUpgrade(c->context, 10000) != REDIS_OK) {
+            fprintf(stderr,"Could not establish URMA connection to Redis at %s:%d: %s\n",
+                    ip,port,c->context->errstr);
+            exit(1);
+        }
     }
     if (config.tls==1) {
         const char *err = NULL;
@@ -1537,6 +1557,8 @@ int parseOptions(int argc, char **argv) {
         } else if (!strcmp(argv[i],"--help")) {
             exit_status = 0;
             goto usage;
+        } else if (!strcmp(argv[i],"--urma")) {
+            config.urma = 1;
         #ifdef USE_OPENSSL
         } else if (!strcmp(argv[i],"--tls")) {
             config.tls = 1;
@@ -1649,6 +1671,8 @@ usage:
 "                    on the command line.\n"
 " -I                 Idle mode. Just open N idle connections and wait.\n"
 " -x                 Read last argument from STDIN.\n"
+" --urma             Use the URMA (umdk) RDMA transport to connect to a server\n"
+"                    built with BUILD_URMA=yes (server rdma-port is used).\n"
 " --seed <num>       Set the seed for random number generator. Default seed is based on time.\n",
 tls_usage,
 " --help             Output this help and exit.\n"
@@ -1783,6 +1807,21 @@ int main(int argc, char **argv) {
     argv += i;
 
     tag = "";
+
+    if (config.urma) {
+        if (config.hostsocket) {
+            fprintf(stderr,"Options --urma and -s are mutually exclusive.\n");
+            exit(1);
+        }
+        if (config.tls) {
+            fprintf(stderr,"Options --urma and --tls are mutually exclusive.\n");
+            exit(1);
+        }
+        if (config.cluster_mode) {
+            fprintf(stderr,"Option --urma is not supported with --cluster.\n");
+            exit(1);
+        }
+    }
 
 #ifdef USE_OPENSSL
     if (config.tls) {

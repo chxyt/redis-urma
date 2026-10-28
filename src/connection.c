@@ -67,7 +67,7 @@ int connTypeInitialize(void) {
     /* may fail if without BUILD_TLS=yes */
     RedisRegisterConnectionTypeTLS();
     
-    /* may fail if without BUILD_RDMA=yes */
+    /* may fail if without BUILD_URMA=yes */
     RegisterConnectionTypeRdma();
 
     return C_OK;

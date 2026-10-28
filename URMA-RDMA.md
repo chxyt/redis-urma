@@ -57,9 +57,9 @@ cp -a lib/liburma.so* lib/liburma_common.so* ~/umdk-install/lib/
 ### 2.2 编译 redis-server
 
 ```bash
-make BUILD_RDMA=yes                 # 默认 URMA_PATH=/home/work/umdk-install
+make BUILD_URMA=yes                 # 默认 URMA_PATH=/home/work/umdk-install
 # 或指定 umdk 安装路径：
-make BUILD_RDMA=yes URMA_PATH=~/umdk-install
+make BUILD_URMA=yes URMA_PATH=~/umdk-install
 ```
 
 说明：
@@ -100,7 +100,32 @@ rdma-rx-size 1mb
 
 ## 4. 客户端
 
-客户端同样需要 URMA 栈（主从复制中即对端 redis-server 实例）：
+### 4.1 redis-cli / redis-benchmark（`--urma`）
+
+`redis-cli` 与 `redis-benchmark` 内置 URMA 传输支持（`src/urma_client.c`），通过
+`--urma` 选项启用。客户端先与 `rdma-port` 建立 TCP 连接作为带外通道完成 RC 建连，
+之后数据面切换到 URMA 通道：
+
+```bash
+# redis-cli：走 RDMA 连接 6380 端口
+./redis-cli --urma -h 192.168.1.10 -p 6380 ping
+
+# redis-benchmark：全部压测连接走 RDMA
+./redis-benchmark --urma -h 192.168.1.10 -p 6380 -t set,get -n 100000 -c 50
+```
+
+说明：
+
+- `-p` 指定的必须是服务端的 **`rdma-port`**（默认 6380），而非普通 TCP 端口。
+- `--urma` 不与 `-s`（unix socket）、`--tls`、`--cluster` 兼容，组合使用会报错退出。
+- 客户端运行环境同样需要 URMA 栈：`liburma.so` / `liburma_common.so` 可通过
+  `ldd` 确认能被解析（编译时 `URMA_PATH` 已通过 rpath 指定）。
+- 建连过程会阻塞直至服务端完成握手；服务端未启用 RDMA 或握手失败时，
+  客户端报错退出并保留底层错误信息（如 `Connection timed out`）。
+
+### 4.2 服务间连接（复制）
+
+主从复制中，对端 redis-server 实例即客户端，同样需要 URMA 栈：
 
 ```bash
 # replica 侧配置
@@ -108,12 +133,9 @@ replicaof 192.168.1.10 6379
 # 复制连接默认走 TCP；RDMA 连接由连接框架按服务端宣告的类型协商
 ```
 
-应用客户端（如 hiredis）目前走 TCP；RDMA 传输主要用于服务间（复制、集群总线）
-及支持该传输的客户端。
-
 ## 5. 验证状态与已知限制
 
-- ✅ 本地（无 UB 设备）`make BUILD_RDMA=yes` 编译、链接通过，
+- ✅ 本地（无 UB 设备）`make BUILD_URMA=yes` 编译、链接通过，
   `ldd redis-server` 可正确解析 `liburma.so` / `liburma_common.so`。
 - ✅ `urma_init(NULL)` 在无 UB 设备的机器上立即返回 0（不阻塞启动）。
 - ⚠️ **未做真实 UB 环境运行验证**：建连、读写、复制等数据面行为需在带 UB 网卡的

@@ -64,6 +64,7 @@
 #include "connection.h"
 #include "cli_common.h"
 #include "mt19937-64.h"
+#include "urma_client.h"
 
 #include "cli_commands.h"
 
@@ -215,6 +216,7 @@ static struct config {
     cliConnInfo conn_info;
     char *hostsocket;
     int tls;
+    int urma; /* use the URMA (umdk) RDMA transport */
     cliSSLconfig sslconfig;
     long repeat;
     long interval;
@@ -1669,6 +1671,18 @@ static int cliConnect(int flags) {
             context = redisConnectUnix(config.hostsocket);
         }
 
+        if (!context->err && config.urma) {
+            if (redisUrmaUpgrade(context, -1) != REDIS_OK) {
+                if (!(flags & CC_QUIET)) {
+                    fprintf(stderr,"Could not establish URMA connection to Redis at %s:%d: %s\n",
+                        config.conn_info.hostip,config.conn_info.hostport,context->errstr);
+                }
+                redisFree(context);
+                context = NULL;
+                return REDIS_ERR;
+            }
+        }
+
         if (!context->err && config.tls) {
             const char *err = NULL;
             if (cliSecureConnection(context, config.sslconfig, &err) == REDIS_ERR && err) {
@@ -2875,6 +2889,8 @@ static int parseOptions(int argc, char **argv) {
             config.test_hint = argv[++i];
         } else if (!strcmp(argv[i],"--test_hint_file") && !lastarg) {
             config.test_hint_file = argv[++i];
+        } else if (!strcmp(argv[i],"--urma")) {
+            config.urma = 1;
 #ifdef USE_OPENSSL
         } else if (!strcmp(argv[i],"--tls")) {
             config.tls = 1;
@@ -3043,6 +3059,8 @@ static void usage(int err) {
 "  -D <delimiter>     Delimiter between responses for raw formatting (default: \\n).\n"
 "  -c                 Enable cluster mode (follow -ASK and -MOVED redirections).\n"
 "  -e                 Return exit error code when command execution fails.\n"
+"  --urma             Use the URMA (umdk) RDMA transport to connect to a server\n"
+"                     built with BUILD_URMA=yes (server rdma-port is used).\n"
 "%s"
 "  --raw              Use raw formatting for replies (default when STDOUT is\n"
 "                     not a tty).\n"
@@ -9845,6 +9863,11 @@ int main(int argc, char **argv) {
     argv += firstarg;
 
     parseEnv();
+
+    if (config.urma && config.hostsocket) {
+        fprintf(stderr,"Options --urma and -s are mutually exclusive.\n");
+        exit(1);
+    }
 
     if (config.askpass) {
         config.conn_info.auth = askPassword("Please input password: ");
