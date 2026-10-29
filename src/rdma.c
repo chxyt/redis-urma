@@ -649,6 +649,13 @@ static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
     urma_import_seg_flag_t flag = {0};
     urma_token_t token;
 
+    /* drop the previous imported seg on re-announce, otherwise the stale
+     * remote mapping lingers in the device */
+    if (ctx->remote_rx_tseg) {
+        urma_unimport_seg(ctx->remote_rx_tseg);
+        ctx->remote_rx_tseg = NULL;
+    }
+
     ctx->remote_rx_seg = cmd->memory.seg;
     ctx->tx_remote_addr = ctx->remote_rx_seg.ubva.va;
     ctx->tx.length = ctx->remote_rx_seg.len;
@@ -762,8 +769,10 @@ pollcq:
         return C_ERR;
     } else if (ret == 0) {
         if (has_event) {
-            /* confirm the jfc events and re-arm, the order is mandatory */
-            nevents = polled;
+            /* confirm the jfc events and re-arm, the order is mandatory.
+             * like urma_perftest, ack exactly 1 event per wait_jfc wakeup,
+             * acking the polled CQE count over-acks and drops later events */
+            nevents = 1;
             urma_ack_jfc(ev_jfc, &nevents, 1);
             if (urma_rearm_jfc(ctx->jfc, false)) {
                 serverLog(LL_WARNING, "RDMA: rearm jfc error");
@@ -777,8 +786,12 @@ pollcq:
 
     if (cr.status != URMA_CR_SUCCESS) {
         if (rdma_conn->c.state == CONN_STATE_CONNECTED) {
-            serverLog(LL_WARNING, "RDMA: CQ handle error status: %d, opcode : 0x%x, s_r : %d, len : %u",
-                cr.status, cr.opcode, cr.flag.bs.s_r, cr.completion_len);
+            /* user_ctx == 0 means a data WRITE, otherwise a control cmd SEND */
+            serverLog(LL_WARNING,
+                "RDMA: CQ handle error status: %d, opcode : 0x%x, s_r : %d, len : %u, "
+                "user_ctx : %llu, tx_off : %u",
+                cr.status, cr.opcode, cr.flag.bs.s_r, cr.completion_len,
+                (unsigned long long)cr.user_ctx, ctx->tx.offset);
         }
         return C_ERR;
     }
@@ -1495,7 +1508,7 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
     wr.user_ctx = 0;
     /* signal the send completion periodically to release TX buffer space */
     wr.flag.bs.complete_enable = (++ctx->tx_ops % (VALKEY_RDMA_MAX_WQE / 2)) ? 0 : 1;
-    wr.flag.bs.place_order = URMA_STRONG_ORDER;
+    /* place_order stays URMA_NO_ORDER(0), mirrors urma_perftest */
     wr.rw.src.sge = &sge;
     wr.rw.src.num_sge = 1;
     wr.rw.dst.sge = &dsge;

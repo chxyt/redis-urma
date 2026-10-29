@@ -322,8 +322,10 @@ pollcq:
         uc->eof = 1;
         return -1;
     } else if (ret == 0) {
-        /* confirm the jfc events and re-arm, the order is mandatory */
-        nevents = polled;
+        /* confirm the jfc events and re-arm, the order is mandatory.
+         * like urma_perftest, ack exactly 1 event per wait_jfc wakeup,
+         * acking the polled CQE count over-acks and drops later events */
+        nevents = 1;
         urma_ack_jfc(ev_jfc, &nevents, 1);
         if (urma_rearm_jfc(uc->jfc, false)) {
             uc->eof = 1;
@@ -492,7 +494,7 @@ static ssize_t urmaCliWrite(redisContext *c) {
             wr.tjetty = uc->tjetty;
             wr.user_ctx = 0;
             wr.flag.bs.complete_enable = 1;
-            wr.flag.bs.place_order = URMA_STRONG_ORDER;
+            /* place_order stays URMA_NO_ORDER(0), mirrors urma_perftest */
             wr.rw.src.sge = &sge;
             wr.rw.src.num_sge = 1;
             wr.rw.dst.sge = &dsge;
