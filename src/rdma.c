@@ -459,9 +459,40 @@ out:
     return ret;
 }
 
-static void rdmaReleaseResource(RdmaContext *ctx) {
-    rdmaDestroyIoBuf(ctx);
+/* after the jetty is set to ERROR, pending WRs are flushed; poll until the
+ * flush completions show up, mirrors urma_perftest drain_inflight_wr */
+static void rdmaDrainCq(RdmaContext *ctx) {
+    urma_cr_t cr[16];
+    int retry = 0;
 
+    while (retry < 100) { /* 100 * 10ms upper bound, best effort */
+        int n = urma_poll_jfc(ctx->jfc, 16, cr);
+        if (n <= 0) {
+            usleep(10000);
+            retry++;
+            continue;
+        }
+        retry = 0;
+        for (int i = 0; i < n; i++) {
+            if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) return;
+        }
+    }
+}
+
+static void rdmaReleaseResource(RdmaContext *ctx) {
+    /* graceful teardown, mirrors the urma_perftest destroy path: error the
+     * jetty so HW flushes the pending WRs and drain the completions, detach
+     * from the peer, and only then release the local memory. Freeing
+     * (unregistering) iobufs while WRs still reference them causes remote
+     * access errors and may block the resource deletion below. */
+    if (ctx->bound) {
+        urma_jetty_attr_t attr = {.mask = JETTY_STATE, .state = URMA_JETTY_STATE_ERROR};
+
+        (void)urma_modify_jetty(ctx->jetty, &attr);
+        rdmaDrainCq(ctx);
+    }
+
+    /* detach from the peer first */
     if (ctx->bound) {
         urma_unbind_jetty(ctx->jetty);
         ctx->bound = 0;
@@ -481,6 +512,9 @@ static void rdmaReleaseResource(RdmaContext *ctx) {
         urma_delete_jfr(ctx->jfr);
         ctx->jfr = NULL;
     }
+
+    /* then release local memory */
+    rdmaDestroyIoBuf(ctx);
 
     if (ctx->jfc) {
         urma_delete_jfc(ctx->jfc);
@@ -743,7 +777,8 @@ pollcq:
 
     if (cr.status != URMA_CR_SUCCESS) {
         if (rdma_conn->c.state == CONN_STATE_CONNECTED) {
-            serverLog(LL_WARNING, "RDMA: CQ handle error status: %d, opcode : 0x%x", cr.status, cr.opcode);
+            serverLog(LL_WARNING, "RDMA: CQ handle error status: %d, opcode : 0x%x, s_r : %d, len : %u",
+                cr.status, cr.opcode, cr.flag.bs.s_r, cr.completion_len);
         }
         return C_ERR;
     }

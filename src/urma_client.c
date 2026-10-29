@@ -122,6 +122,8 @@ typedef struct urmaClient {
     uint64_t remote_addr;
 
     int eof; /* peer is gone */
+    /* diagnostics of the last fatal CQ completion, reported via errstr */
+    int last_cq_status, last_cq_opcode;
 } urmaClient;
 
 static long long urmaCliMstime(void) {
@@ -332,6 +334,9 @@ pollcq:
 
     polled++;
     if (cr.status != URMA_CR_SUCCESS) {
+        /* keep the completion details for the error message */
+        uc->last_cq_status = cr.status;
+        uc->last_cq_opcode = cr.opcode;
         uc->eof = 1;
         return -1;
     }
@@ -372,7 +377,13 @@ pollcq:
 static void urmaCliSetError(redisContext *c, urmaClient *uc, const char *what) {
     if (uc && uc->eof) {
         c->err = REDIS_ERR_EOF;
-        snprintf(c->errstr, sizeof(c->errstr), "URMA connection is gone (%s)", what);
+        if (uc->last_cq_status) {
+            snprintf(c->errstr, sizeof(c->errstr),
+                     "URMA connection is gone (%s, cq status %d, opcode 0x%x)",
+                     what, uc->last_cq_status, uc->last_cq_opcode);
+        } else {
+            snprintf(c->errstr, sizeof(c->errstr), "URMA connection is gone (%s)", what);
+        }
     } else {
         c->err = REDIS_ERR_IO;
         snprintf(c->errstr, sizeof(c->errstr), "URMA %s error: %s", what, strerror(errno));
@@ -513,12 +524,51 @@ static void urmaCliNetClose(redisContext *c) {
     }
 }
 
+/* after the jetty is set to ERROR, pending WRs are flushed; poll until the
+ * flush completions show up, mirrors urma_perftest drain_inflight_wr */
+static void urmaCliDrainCq(urmaClient *uc) {
+    urma_cr_t cr[16];
+    int retry = 0;
+
+    while (retry < 100) { /* 100 * 10ms upper bound, best effort */
+        int n = urma_poll_jfc(uc->jfc, 16, cr);
+        if (n <= 0) {
+            usleep(10000);
+            retry++;
+            continue;
+        }
+        retry = 0;
+        for (int i = 0; i < n; i++) {
+            if (cr[i].status == URMA_CR_WR_FLUSH_ERR_DONE) return;
+        }
+    }
+}
+
 static void urmaCliFreePrivctx(void *privctx) {
     urmaClient *uc = privctx;
 
     if (!uc) return;
 
+    /* graceful teardown, mirrors the urma_perftest destroy path: error the
+     * jetty so HW flushes the pending WRs, drain completions, detach from
+     * the peer, and only then free local resources. Freeing (unregistering)
+     * segments while WRs still reference them causes remote LOC_LEN_ERR and
+     * blocks the resource deletion below. */
+    if (uc->bound) {
+        urma_jetty_attr_t attr = {.mask = JETTY_STATE, .state = URMA_JETTY_STATE_ERROR};
+
+        (void)urma_modify_jetty(uc->jetty, &attr);
+        urmaCliDrainCq(uc);
+    }
+
+    /* detach from the peer first */
     if (uc->remote_rx_tseg) urma_unimport_seg(uc->remote_rx_tseg);
+    if (uc->bound) urma_unbind_jetty(uc->jetty);
+    if (uc->tjetty) urma_unimport_jetty(uc->tjetty);
+    if (uc->jetty) urma_delete_jetty(uc->jetty);
+    if (uc->jfr) urma_delete_jfr(uc->jfr);
+
+    /* then release local memory */
     if (uc->tx_tseg) urma_unregister_seg(uc->tx_tseg);
     if (uc->rx_tseg) urma_unregister_seg(uc->rx_tseg);
     if (uc->cmd_tseg) urma_unregister_seg(uc->cmd_tseg);
@@ -526,10 +576,6 @@ static void urmaCliFreePrivctx(void *privctx) {
     free(uc->rx_addr);
     free(uc->cmd_buf);
 
-    if (uc->bound) urma_unbind_jetty(uc->jetty);
-    if (uc->tjetty) urma_unimport_jetty(uc->tjetty);
-    if (uc->jetty) urma_delete_jetty(uc->jetty);
-    if (uc->jfr) urma_delete_jfr(uc->jfr);
     if (uc->jfc) urma_delete_jfc(uc->jfc);
     if (uc->jfce) urma_delete_jfce(uc->jfce);
     if (uc->uctx) urma_delete_context(uc->uctx);

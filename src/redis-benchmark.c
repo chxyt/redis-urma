@@ -366,6 +366,21 @@ fail:
         else
             fprintf(stderr, "Node %s replied with error:\n%s\n", hostsocket, reply->str);
         abort_test = 1;
+    } else if (reply && reply->type == REDIS_REPLY_ERROR) {
+        /* print any error reply, not just NOAUTH, so transport level
+         * problems are visible */
+        if (hostsocket == NULL)
+            fprintf(stderr, "Node %s:%d replied with error:\n%s\n", ip, port, reply->str);
+        else
+            fprintf(stderr, "Node %s replied with error:\n%s\n", hostsocket, reply->str);
+    } else if (c != NULL && c->err) {
+        if (hostsocket == NULL)
+            fprintf(stderr, "Could not fetch config from Redis at %s:%d: %s\n", ip, port, c->errstr);
+        else
+            fprintf(stderr, "Could not fetch config from Redis at %s: %s\n", hostsocket, c->errstr);
+    } else {
+        fprintf(stderr, "Could not fetch config from Redis (unexpected reply type %d)\n",
+            reply ? reply->type : -1);
     }
     freeReplyObject(reply);
     redisFree(c);
