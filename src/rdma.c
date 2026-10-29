@@ -658,6 +658,11 @@ static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
 
     ctx->remote_rx_seg = cmd->memory.seg;
     ctx->tx_remote_addr = ctx->remote_rx_seg.ubva.va;
+    serverLog(LL_NOTICE,
+              "RDMA: import remote rx seg: va 0x%lx len %lu uasid %u token 0x%x",
+              (unsigned long)ctx->remote_rx_seg.ubva.va,
+              (unsigned long)ctx->remote_rx_seg.len,
+              ctx->remote_rx_seg.ubva.uasid, ntohl(cmd->memory.token));
     ctx->tx.length = ctx->remote_rx_seg.len;
     ctx->tx_key = ntohl(cmd->memory.token);
     ctx->tx.offset = 0;
@@ -1521,6 +1526,13 @@ static size_t connRdmaSend(connection *conn, const void *data, size_t data_len) 
         serverLog(LL_WARNING, "RDMA: post send failed: %d", ret);
         conn->state = CONN_STATE_ERROR;
         return C_ERR;
+    }
+
+    if (ctx->tx_ops <= 2) { /* log the first writes, WQE level diagnostics */
+        serverLog(LL_NOTICE,
+                  "RDMA: WRITE #%lu: src 0x%lx len %zu (tseg off %u), dst 0x%lx len %zu, imm %zu",
+                  (unsigned long)ctx->tx_ops, (unsigned long)(uintptr_t)addr, data_len, off,
+                  (unsigned long)remote_addr, data_len, data_len);
     }
 
     ctx->tx.offset += data_len;

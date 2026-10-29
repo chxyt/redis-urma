@@ -245,6 +245,10 @@ static int urmaCliImportRemoteRx(urmaClient *uc, ValkeyRdmaCmd *cmd) {
 
     uc->remote_rx_seg = cmd->memory.seg;
     uc->remote_addr = uc->remote_rx_seg.ubva.va;
+    fprintf(stderr, "URMA: import remote rx seg: va 0x%lx len %lu uasid %u token 0x%x\n",
+            (unsigned long)uc->remote_rx_seg.ubva.va,
+            (unsigned long)uc->remote_rx_seg.len,
+            uc->remote_rx_seg.ubva.uasid, ntohl(cmd->memory.token));
     token.token = ntohl(cmd->memory.token);
 
     flag.bs.access = URMA_ACCESS_READ | URMA_ACCESS_WRITE;
@@ -507,6 +511,10 @@ static ssize_t urmaCliWrite(redisContext *c) {
                 snprintf(c->errstr, sizeof(c->errstr), "URMA post write failed");
                 return -1;
             }
+
+            fprintf(stderr, "URMA: WRITE: src 0x%lx len %u, dst 0x%lx len %u, imm %u\n",
+                    (unsigned long)(uintptr_t)(uc->tx_addr + uc->tx_off), chunk,
+                    (unsigned long)(uc->remote_addr + uc->tx_off), chunk, chunk);
         }
 
         uc->tx_off += chunk;
