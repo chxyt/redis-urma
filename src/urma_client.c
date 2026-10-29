@@ -363,17 +363,15 @@ pollcq:
             uc->eof = 1;
             return -1;
         }
-    } else { /* send side: cmd buffers are recycled, WRITE_IMM is void */
-        switch (cr.opcode) {
-        case URMA_CR_OPC_SEND:
-        case URMA_CR_OPC_SEND_WITH_IMM: {
+    } else { /* send side: the driver does not fill cr.opcode for send CRs
+              * (always URMA_CR_OPC_SEND), dispatch by user_ctx instead:
+              * 0 is a void WRITE completion, otherwise a cmd SEND whose
+              * buffer is recycled */
+        if (cr.user_ctx) {
             ValkeyRdmaCmd *cmd = (ValkeyRdmaCmd *)(uintptr_t)cr.user_ctx;
 
             memset(cmd, 0x00, sizeof(*cmd));
             cmd->keepalive.opcode = VALKEY_RDMA_INVALID_OPCODE;
-            break;
-        }
-        default: break;
         }
     }
 
@@ -836,15 +834,23 @@ int redisUrmaUpgrade(redisContext *c, long long timeout_ms) {
         goto fail;
     }
 
+    /* fix up the announced remote jetty transport attributes before
+     * importing it, mirrors urma_perftest connect_jetty_default() */
+    if (peer_rjetty.trans_mode == URMA_TM_RC && peer_rjetty.flag.bs.order_type == URMA_OT) {
+        peer_rjetty.flag.bs.share_tp = 1;
+    }
+    peer_rjetty.tp_type = URMA_RTP;
+
     uc->tjetty = urma_import_jetty(uc->uctx, &peer_rjetty, &token);
     if (!uc->tjetty) {
         c->err = REDIS_ERR_IO;
         snprintf(c->errstr, sizeof(c->errstr), "URMA upgrade: import peer jetty failed");
         goto fail;
     }
-    if (urma_bind_jetty(uc->jetty, uc->tjetty)) {
+    status = urma_bind_jetty(uc->jetty, uc->tjetty);
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
         c->err = REDIS_ERR_IO;
-        snprintf(c->errstr, sizeof(c->errstr), "URMA upgrade: bind jetty failed");
+        snprintf(c->errstr, sizeof(c->errstr), "URMA upgrade: bind jetty failed (status %d)", (int)status);
         goto fail;
     }
     uc->bound = 1;

@@ -748,13 +748,6 @@ static int connRdmaHandleRecvImm(RdmaContext *ctx, uint32_t byte_len) {
     return C_OK;
 }
 
-static int connRdmaHandleWrite(RdmaContext *ctx, uint32_t byte_len) {
-    UNUSED(ctx);
-    UNUSED(byte_len);
-
-    return C_OK;
-}
-
 
 static int connRdmaHandleCq(rdma_connection *rdma_conn) {
     RdmaContext *ctx = rdma_conn->ctx;
@@ -819,24 +812,13 @@ pollcq:
             break;
         default: serverLog(LL_WARNING, "RDMA: unexpected recv opcode 0x[%x]", cr.opcode); return C_ERR;
         }
-    } else { /* send side */
-        switch (cr.opcode) {
-        case URMA_CR_OPC_SEND:
-        case URMA_CR_OPC_SEND_WITH_IMM:
+    } else { /* send side: the driver does not fill cr.opcode for send CRs
+              * (always URMA_CR_OPC_SEND), dispatch by user_ctx instead:
+              * 0 is a data WRITE, otherwise a control cmd SEND */
+        if (cr.user_ctx) {
             if (connRdmaHandleSend((ValkeyRdmaCmd *)(uintptr_t)cr.user_ctx) == C_ERR) {
                 return C_ERR;
             }
-
-            break;
-
-        case URMA_CR_OPC_WRITE_WITH_IMM:
-            if (connRdmaHandleWrite(ctx, cr.completion_len) == C_ERR) {
-                return C_ERR;
-            }
-
-            break;
-
-        default: break;
         }
     }
 
@@ -886,15 +868,25 @@ static connection *connCreateAcceptedRdma(int fd, void *priv) {
 /* import the peer jetty and construct the RC transport channel */
 static int rdmaEstablish(RdmaContext *ctx) {
     urma_token_t token = {.token = VALKEY_RDMA_JETTY_TOKEN};
+    urma_rjetty_t *rjetty = &ctx->peer_rjetty;
+    urma_status_t status;
 
-    ctx->tjetty = urma_import_jetty(ctx->uctx, &ctx->peer_rjetty, &token);
+    /* fix up the announced remote jetty transport attributes before
+     * importing it, mirrors urma_perftest connect_jetty_default() */
+    if (rjetty->trans_mode == URMA_TM_RC && rjetty->flag.bs.order_type == URMA_OT) {
+        rjetty->flag.bs.share_tp = 1;
+    }
+    rjetty->tp_type = URMA_RTP;
+
+    ctx->tjetty = urma_import_jetty(ctx->uctx, rjetty, &token);
     if (!ctx->tjetty) {
         serverLog(LL_WARNING, "RDMA: import peer jetty failed");
         return C_ERR;
     }
 
-    if (urma_bind_jetty(ctx->jetty, ctx->tjetty)) {
-        serverLog(LL_WARNING, "RDMA: bind jetty failed");
+    status = urma_bind_jetty(ctx->jetty, ctx->tjetty);
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+        serverLog(LL_WARNING, "RDMA: bind jetty failed: %d", (int)status);
         return C_ERR;
     }
     ctx->bound = 1;
