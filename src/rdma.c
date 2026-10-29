@@ -676,6 +676,11 @@ static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
         return C_ERR;
     }
 
+    /* EXPERIMENT: the device may set up the mapping of the imported seg
+     * asynchronously, the first WRITE right after the import gets rejected
+     * with LOC_LEN_ERR occasionally. sleep to let the mapping settle. */
+    usleep(200 * 1000);
+
     return rdmaAdjustSendbuf(ctx, ctx->tx.length);
 }
 
