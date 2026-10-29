@@ -1819,8 +1819,15 @@ static void rdmaInit(void) {
     VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaMemory) != 64);
     VALKEY_BUILD_BUG_ON(sizeof(ValkeyRdmaCmd) != 64);
 
-    if (urma_init(NULL)) {
-        serverLog(LL_WARNING, "RDMA: FATAL error, urma init failed");
+    urma_init_attr_t init_attr = {
+        .token = 0,
+        .uasid = 0,
+    };
+    urma_status_t status = urma_init(&init_attr);
+
+    /* tolerate URMA_EEXIST: urma may already be initialized in-process */
+    if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+        serverLog(LL_WARNING, "RDMA: FATAL error, urma init failed (status %d)", (int)status);
     }
 }
 

@@ -137,7 +137,8 @@ replicaof 192.168.1.10 6379
 
 - ✅ 本地（无 UB 设备）`make BUILD_URMA=yes` 编译、链接通过，
   `ldd redis-server` 可正确解析 `liburma.so` / `liburma_common.so`。
-- ✅ `urma_init(NULL)` 在无 UB 设备的机器上立即返回 0（不阻塞启动）。
+- ✅ `urma_init(&init_attr)`（token=0, uasid=0）在无 UB 设备的机器上立即返回 0
+  （不阻塞启动）。注意不能传 `NULL`，需按 API Guide 传入初始化属性。
 - ⚠️ **未做真实 UB 环境运行验证**：建连、读写、复制等数据面行为需在带 UB 网卡的
   机器上测试。建议的最小验证序列：
   1. 两台机器分别确认 `urma_get_device_list()` 能枚举到设备；

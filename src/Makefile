@@ -376,11 +376,6 @@ REDIS_CHECK_RDB_NAME=redis-check-rdb$(PROG_SUFFIX)
 REDIS_CHECK_AOF_NAME=redis-check-aof$(PROG_SUFFIX)
 ALL_SOURCES=$(sort $(patsubst %.o,%.c,$(REDIS_SERVER_OBJ) $(REDIS_CLI_OBJ) $(REDIS_BENCHMARK_OBJ)))
 
-ifeq ($(BUILD_URMA),yes)
-    REDIS_CFLAGS += -DBUILD_URMA
-    REDIS_LDFLAGS += -L$(URMA_PATH)/lib -lurma -lurma_common -Wl,-rpath,$(URMA_PATH)/lib,--disable-new-dtags
-endif
-
 all: $(REDIS_SERVER_NAME) $(REDIS_SENTINEL_NAME) $(REDIS_CLI_NAME) $(REDIS_BENCHMARK_NAME) $(REDIS_CHECK_RDB_NAME) $(REDIS_CHECK_AOF_NAME) $(TLS_MODULE)
 	@echo ""
 	@echo "Hint: It's a good idea to run 'make test' ;)"

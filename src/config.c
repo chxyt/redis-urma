@@ -591,27 +591,28 @@ void loadServerConfigFromString(char *config) {
                 }
                 queueSentinelConfig(argv+1,argc-1,linenum,lines[i]);
             }
-            /* RDMA configuration */
-            else if (!strcasecmp(argv[0],"rdma-port") && argc == 2) {
-                    server.rdma_ctx_config.port = atoi(argv[1]);
-                } else if (!strcasecmp(argv[0],"rdma-bind") && argc >= 2) {
-                    if (argc - 1 > CONFIG_BINDADDR_MAX) {
-                        err = "Too many rdma-bind addresses specified";
-                        goto loaderr;
-                    }
-                    server.rdma_ctx_config.bindaddr_count = argc - 1;
-                    for (int j = 0; j < server.rdma_ctx_config.bindaddr_count; j++) {
-                        server.rdma_ctx_config.bindaddr[j] = zstrdup(argv[j+1]);
-                    }
-                } else if (!strcasecmp(argv[0],"rdma-rx-size") && argc == 2) {
-                    server.rdma_ctx_config.rx_size = memtoll(argv[1], &err);
-                    if (err) goto loaderr;
-                } else if (!strcasecmp(argv[0],"rdma-completion-vector") && argc == 2) {
-                    server.rdma_ctx_config.completion_vector = atoi(argv[1]);
-                }
-                } else {
-                    err = "Bad directive or wrong number of arguments"; goto loaderr;
-                }
+        }
+        /* RDMA configuration */
+        else if (!strcasecmp(argv[0],"rdma-port") && argc == 2) {
+            server.rdma_ctx_config.port = atoi(argv[1]);
+        } else if (!strcasecmp(argv[0],"rdma-bind") && argc >= 2) {
+            if (argc - 1 > CONFIG_BINDADDR_MAX) {
+                err = "Too many rdma-bind addresses specified";
+                goto loaderr;
+            }
+            server.rdma_ctx_config.bindaddr_count = argc - 1;
+            for (int j = 0; j < server.rdma_ctx_config.bindaddr_count; j++) {
+                server.rdma_ctx_config.bindaddr[j] = zstrdup(argv[j+1]);
+            }
+        } else if (!strcasecmp(argv[0],"rdma-rx-size") && argc == 2) {
+            int rx_err;
+            server.rdma_ctx_config.rx_size = (int)memtoull(argv[1], &rx_err);
+            if (rx_err) goto loaderr;
+        } else if (!strcasecmp(argv[0],"rdma-completion-vector") && argc == 2) {
+            server.rdma_ctx_config.completion_vector = atoi(argv[1]);
+        } else {
+            err = "Bad directive or wrong number of arguments"; goto loaderr;
+        }
         sdsfreesplitres(argv,argc);
         argv = NULL;
     }

@@ -710,6 +710,7 @@ int redisUrmaUpgrade(redisContext *c, long long timeout_ms) {
     urma_rjetty_t local_rjetty, peer_rjetty;
     urma_token_t token = {.token = VALKEY_RDMA_JETTY_TOKEN};
     long long deadline = (timeout_ms < 0) ? -1 : urmaCliMstime() + timeout_ms;
+    urma_status_t status;
 
     if (!c || c->err || c->fd < 0) {
         if (c && !c->err) {
@@ -717,6 +718,23 @@ int redisUrmaUpgrade(redisContext *c, long long timeout_ms) {
             snprintf(c->errstr, sizeof(c->errstr), "URMA upgrade: invalid context");
         }
         return REDIS_ERR;
+    }
+
+    /* must init the urma environment before touching any resource, the
+     * client process has nobody else doing it; tolerate URMA_EEXIST */
+    {
+        urma_init_attr_t init_attr = {
+            .token = 0,
+            .uasid = 0,
+        };
+
+        status = urma_init(&init_attr);
+        if (status != URMA_SUCCESS && status != URMA_EEXIST) {
+            c->err = REDIS_ERR_IO;
+            snprintf(c->errstr, sizeof(c->errstr),
+                     "URMA upgrade: urma init failed (status %d)", (int)status);
+            return REDIS_ERR;
+        }
     }
 
     uc = calloc(1, sizeof(*uc));
