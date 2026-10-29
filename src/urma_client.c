@@ -146,21 +146,6 @@ static void *page_aligned_zalloc(size_t size) {
     return tmp;
 }
 
-/* wait for readability on the completion event fd */
-static int urmaCliWaitEvent(urmaClient *uc, long long timeout_ms) {
-    struct pollfd pfd = {.fd = uc->jfce->fd, .events = POLLIN, .revents = 0};
-    int rc;
-
-    if (timeout_ms < 0) timeout_ms = -1;
-    rc = poll(&pfd, 1, (int)timeout_ms);
-    if (rc <= 0) return 0;
-
-    {
-        urma_jfc_t *ev_jfc[1] = {NULL};
-        return urma_wait_jfc(uc->jfce, 1, 0, ev_jfc) > 0;
-    }
-}
-
 static int urmaCliPostRecv(urmaClient *uc, ValkeyRdmaCmd *cmd) {
     urma_jfr_wr_t wr = {0};
     urma_sge_t sge;
@@ -318,7 +303,16 @@ static int urmaCliPollCq(urmaClient *uc, long long timeout_ms) {
     int polled = 0;
     int ret;
 
-    if (!urmaCliWaitEvent(uc, timeout_ms)) return 0;
+    /* wait for readability on the completion event fd, then consume the
+     * event: urma_wait_jfc fills ev_jfc with the jfc owning the event,
+     * which must be passed to urma_ack_jfc afterwards */
+    {
+        struct pollfd pfd = {.fd = uc->jfce->fd, .events = POLLIN, .revents = 0};
+        int rc = poll(&pfd, 1, (int)(timeout_ms < 0 ? -1 : timeout_ms));
+
+        if (rc <= 0) return 0;
+        if (urma_wait_jfc(uc->jfce, 1, 0, ev_jfc) <= 0) return 0;
+    }
 
 pollcq:
     ret = urma_poll_jfc(uc->jfc, 1, &cr);
