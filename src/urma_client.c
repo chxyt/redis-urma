@@ -597,17 +597,35 @@ static redisContextFuncs redisContextUrmaFuncs = {
 
 static int urmaCliCreateResource(urmaClient *uc) {
     urma_device_t **dev_list = NULL;
+    urma_device_attr_t dev_attr = {0};
     urma_jfc_cfg_t jfc_cfg = {0};
     urma_jfr_cfg_t jfr_cfg = {0};
     urma_jetty_cfg_t jetty_cfg = {0};
     urma_seg_cfg_t seg_cfg = {0};
     int num_devices = 0;
     int i;
+    int priority;
     int ret = -1;
 
     dev_list = urma_get_device_list(&num_devices);
     if (!dev_list || num_devices <= 0) {
         if (dev_list) urma_free_device_list(dev_list);
+        return -1;
+    }
+
+    /* each priority is bound to a TP type by the device (see urma_perftest
+     * get_jetty_priority_by_tp_type), pick the lowest one supporting RTP,
+     * a mismatched priority makes urma_bind_jetty fail with
+     * 'get tp id list failed' in kernel log */
+    if (urma_query_device(dev_list[0], &dev_attr)) {
+        urma_free_device_list(dev_list);
+        return -1;
+    }
+    for (priority = 0; priority <= URMA_MAX_PRIORITY; priority++) {
+        if (dev_attr.dev_cap.priority_info[priority].tp_type.bs.rtp) break;
+    }
+    if (priority > URMA_MAX_PRIORITY) {
+        urma_free_device_list(dev_list);
         return -1;
     }
 
@@ -636,7 +654,7 @@ static int urmaCliCreateResource(urmaClient *uc) {
     jetty_cfg.flag.bs.share_jfr = 1;
     jetty_cfg.jfs_cfg.depth = URMA_CLI_MAX_WQE;
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RC;
-    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jetty_cfg.jfs_cfg.priority = (uint8_t)priority;
     jetty_cfg.jfs_cfg.max_sge = 1;
     jetty_cfg.jfs_cfg.max_inline_data = 0;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;

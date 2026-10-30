@@ -87,7 +87,7 @@ typedef enum ValkeyRdmaOpcode {
 } ValkeyRdmaOpcode;
 
 #define VALKEY_BUILD_BUG_ON(cond) ((void)sizeof(char[1 - 2 * !!(cond)]))
-#define VALKEY_RDMA_MAX_WQE 1024
+#define VALKEY_RDMA_MAX_WQE 128 /* EXPERIMENT: 1024 -> 128, align with the client */
 #define VALKEY_RDMA_DEFAULT_RX_SIZE (1024 * 1024)
 #define VALKEY_RDMA_MIN_RX_SIZE (64 * 1024)
 #define VALKEY_RDMA_MAX_RX_SIZE (16 * 1024 * 1024)
@@ -138,6 +138,7 @@ typedef struct RdmaContext {
     urma_target_jetty_t *tjetty; /* remote jetty imported from peer */
     int bound;                   /* jetty bound with remote peer */
     int max_sge;                 /* device capability */
+    int jetty_priority;          /* lowest priority supporting RTP */
 
     /* handshake state */
     RdmaHsState hs_state;
@@ -345,6 +346,22 @@ destroy_iobuf:
 }
 
 
+/* Each priority is bound to a TP type by the device (see urma_perftest
+ * get_jetty_priority_by_tp_type), picking a priority whose TP type is not
+ * provisioned makes urma_bind_jetty fail with 'get tp id list failed' in
+ * kernel log. Select the lowest priority supporting RTP like perftest does. */
+static int rdmaGetJettyPriority(const urma_device_attr_t *dev_attr) {
+    int i;
+
+    for (i = 0; i <= URMA_MAX_PRIORITY; i++) {
+        if (dev_attr->dev_cap.priority_info[i].tp_type.bs.rtp) {
+            return i;
+        }
+    }
+
+    return -1;
+}
+
 static int rdmaCreateResource(RdmaContext *ctx) {
     urma_device_t **dev_list = NULL;
     urma_device_attr_t dev_attr = {0};
@@ -373,6 +390,17 @@ static int rdmaCreateResource(RdmaContext *ctx) {
         goto out;
     }
     ctx->max_sge = dev_attr.dev_cap.max_jfs_sge;
+
+    {
+        int priority = rdmaGetJettyPriority(&dev_attr);
+
+        if (priority < 0) {
+            serverLog(LL_WARNING, "RDMA: no priority supports RTP on this device");
+            goto out;
+        }
+        ctx->jetty_priority = priority;
+        serverLog(LL_NOTICE, "RDMA: jetty priority %d (RTP)", priority);
+    }
 
     ctx->uctx = urma_create_context(dev_list[0], 0);
     if (!ctx->uctx) {
@@ -411,7 +439,7 @@ static int rdmaCreateResource(RdmaContext *ctx) {
     jetty_cfg.flag.bs.share_jfr = 1;
     jetty_cfg.jfs_cfg.depth = VALKEY_RDMA_MAX_WQE;
     jetty_cfg.jfs_cfg.trans_mode = URMA_TM_RC;
-    jetty_cfg.jfs_cfg.priority = URMA_MAX_PRIORITY;
+    jetty_cfg.jfs_cfg.priority = (uint8_t)ctx->jetty_priority;
     jetty_cfg.jfs_cfg.max_sge = 1;
     jetty_cfg.jfs_cfg.max_inline_data = 0;
     jetty_cfg.jfs_cfg.rnr_retry = URMA_TYPICAL_RNR_RETRY;
@@ -675,11 +703,6 @@ static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
         serverLog(LL_WARNING, "RDMA: import remote rx seg failed");
         return C_ERR;
     }
-
-    /* EXPERIMENT: the device may set up the mapping of the imported seg
-     * asynchronously, the first WRITE right after the import gets rejected
-     * with LOC_LEN_ERR occasionally. sleep to let the mapping settle. */
-    usleep(200 * 1000);
 
     return rdmaAdjustSendbuf(ctx, ctx->tx.length);
 }
