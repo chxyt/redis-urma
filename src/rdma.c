@@ -924,9 +924,16 @@ static int rdmaEstablish(RdmaContext *ctx) {
      * hopeless retries */
     if (rjetty->trans_mode != URMA_TM_RM && rjetty->trans_mode != URMA_TM_RC &&
         rjetty->trans_mode != URMA_TM_UM) {
+        char dump[3 * sizeof(*rjetty) + 1];
+        size_t i;
+
+        for (i = 0; i < sizeof(*rjetty); i++) {
+            snprintf(dump + 3 * i, sizeof(dump) - 3 * i, "%02x ",
+                     ((unsigned char *)rjetty)[i]);
+        }
         serverLog(LL_WARNING, "RDMA: peer is not speaking URMA (trans_mode %llu), "
-                              "plain TCP client on the RDMA port?",
-                  (unsigned long long)rjetty->trans_mode);
+                              "plain TCP client on the RDMA port? got: %s",
+                  (unsigned long long)rjetty->trans_mode, dump);
         return C_ERR;
     }
 

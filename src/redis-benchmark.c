@@ -274,6 +274,7 @@ static redisContext *getRedisContext(const char *ip, int port,
         goto cleanup;
     }
     if (config.urma && hostsocket == NULL) {
+        fprintf(stderr, "URMA: upgrading connection to %s:%d\n", ip, port);
         if (redisUrmaUpgrade(ctx, 10000) != REDIS_OK) {
             fprintf(stderr,"Could not establish URMA connection to Redis at %s:%d: %s\n",
                     ip,port,ctx->errstr);
