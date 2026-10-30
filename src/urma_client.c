@@ -872,6 +872,22 @@ int redisUrmaUpgrade(redisContext *c, long long timeout_ms) {
     }
     uc->bound = 1;
 
+    /* both peers exchange a 1-byte ready mark after the jetty bind, no WR
+     * may be posted into the transport before both binds have completed,
+     * otherwise the first SEND races the peer TP setup and fails with a
+     * local access error on slower (cross-machine) links; mirrors the
+     * server handshake in src/rdma.c */
+    {
+        char mark = 0;
+
+        if (urmaCliWriteAll(c->fd, "R", 1, deadline) ||
+            urmaCliReadAll(c->fd, &mark, 1, deadline) || mark != 'R') {
+            c->err = REDIS_ERR_IO;
+            snprintf(c->errstr, sizeof(c->errstr), "URMA upgrade: ready mark exchange failed");
+            goto fail;
+        }
+    }
+
     /* announce our RX buffer and wait for the peer one, the RC channel is
      * usable after that */
     if (urmaCliRegisterRx(uc)) {

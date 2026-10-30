@@ -146,6 +146,8 @@ typedef struct RdmaContext {
     urma_rjetty_t peer_rjetty;
     size_t hs_sent; /* bytes of local rjetty already sent */
     size_t hs_got;  /* bytes of peer rjetty already received */
+    size_t hs_rsent; /* bytes of the post-bind ready mark already sent */
+    size_t hs_rgot;  /* bytes of the peer post-bind ready mark received */
 
     /* TX */
     RdmaXfer tx;
@@ -713,7 +715,11 @@ static int connRdmaImportRemoteRx(RdmaContext *ctx, ValkeyRdmaCmd *cmd) {
         return C_ERR;
     }
 
-    return rdmaAdjustSendbuf(ctx, ctx->tx.length);
+    if (rdmaAdjustSendbuf(ctx, ctx->tx.length) == C_ERR) {
+        return C_ERR;
+    }
+
+    return C_OK;
 }
 
 static inline void rdmaDelKeepalive(aeEventLoop *el, RdmaContext *ctx) {
@@ -974,6 +980,8 @@ static void rdmaSetEstablished(aeEventLoop *el, rdma_connection *rdma_conn) {
         return;
     }
 
+    /* both binds have completed (ready marks exchanged), the transport is
+     * usable, announce our RX transfer buffer */
     connRdmaRegisterRx(ctx);
 
     if (conn->state == CONN_STATE_CONNECTED && conn->conn_handler && ctx->conn == conn) {
@@ -1037,9 +1045,39 @@ static void connRdmaTcpProcess(aeEventLoop *el, rdma_connection *rdma_conn) {
         if (rdmaEstablish(ctx) == C_ERR) {
             goto tcp_fail;
         }
-
-        rdmaSetEstablished(el, rdma_conn);
+        ctx->hs_state = HS_ESTABLISHED;
     }
+
+    /* both peers exchange a 1-byte ready mark after the jetty bind, no WR
+     * may be posted into the transport before both binds have completed,
+     * otherwise the first SEND races the peer TP setup and fails with a
+     * local access error on slower (cross-machine) links */
+    while (ctx->hs_rsent < 1) {
+        n = write(rdma_conn->cfd, "R", 1 - ctx->hs_rsent);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            serverLog(LL_WARNING, "RDMA: send ready mark failed: %s", strerror(errno));
+            goto tcp_fail;
+        }
+        ctx->hs_rsent += n;
+    }
+
+    while (ctx->hs_rgot < 1) {
+        char mark;
+        n = read(rdma_conn->cfd, &mark, 1 - ctx->hs_rgot);
+        if (n < 0) {
+            if (errno == EAGAIN || errno == EINTR) return;
+            serverLog(LL_WARNING, "RDMA: recv ready mark failed: %s", strerror(errno));
+            goto tcp_fail;
+        }
+        if (n == 0) {
+            serverLog(LL_WARNING, "RDMA: peer closed the TCP channel during handshake");
+            goto tcp_fail;
+        }
+        ctx->hs_rgot += n;
+    }
+
+    rdmaSetEstablished(el, rdma_conn);
 
     return;
 
