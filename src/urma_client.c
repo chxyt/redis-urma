@@ -614,15 +614,16 @@ static int urmaCliCreateResource(urmaClient *uc) {
     }
 
     /* each priority is bound to a TP type by the device (see urma_perftest
-     * get_jetty_priority_by_tp_type), pick the lowest one supporting RTP,
-     * a mismatched priority makes urma_bind_jetty fail with
+     * get_jetty_priority_by_tp_type), pick the lowest one supporting CTP:
+     * bonding devices only provision CTP pools (perftest requires --ctp on
+     * bonding_dev), a mismatched priority makes urma_bind_jetty fail with
      * 'get tp id list failed' in kernel log */
     if (urma_query_device(dev_list[0], &dev_attr)) {
         urma_free_device_list(dev_list);
         return -1;
     }
     for (priority = 0; priority <= URMA_MAX_PRIORITY; priority++) {
-        if (dev_attr.dev_cap.priority_info[priority].tp_type.bs.rtp) break;
+        if (dev_attr.dev_cap.priority_info[priority].tp_type.bs.ctp) break;
     }
     if (priority > URMA_MAX_PRIORITY) {
         urma_free_device_list(dev_list);
@@ -851,7 +852,9 @@ int redisUrmaUpgrade(redisContext *c, long long timeout_ms) {
     if (peer_rjetty.trans_mode == URMA_TM_RC && peer_rjetty.flag.bs.order_type == URMA_OT) {
         peer_rjetty.flag.bs.share_tp = 1;
     }
-    peer_rjetty.tp_type = URMA_RTP;
+    /* bonding devices only provision CTP TP pools, keep in sync with the
+     * local jetty priority selected in urmaCliCreateResource */
+    peer_rjetty.tp_type = URMA_CTP;
 
     uc->tjetty = urma_import_jetty(uc->uctx, &peer_rjetty, &token);
     if (!uc->tjetty) {

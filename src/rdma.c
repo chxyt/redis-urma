@@ -349,12 +349,13 @@ destroy_iobuf:
 /* Each priority is bound to a TP type by the device (see urma_perftest
  * get_jetty_priority_by_tp_type), picking a priority whose TP type is not
  * provisioned makes urma_bind_jetty fail with 'get tp id list failed' in
- * kernel log. Select the lowest priority supporting RTP like perftest does. */
+ * kernel log. Bonding devices only provision CTP pools (perftest requires
+ * --ctp on bonding_dev), so select the lowest priority supporting CTP. */
 static int rdmaGetJettyPriority(const urma_device_attr_t *dev_attr) {
     int i;
 
     for (i = 0; i <= URMA_MAX_PRIORITY; i++) {
-        if (dev_attr->dev_cap.priority_info[i].tp_type.bs.rtp) {
+        if (dev_attr->dev_cap.priority_info[i].tp_type.bs.ctp) {
             return i;
         }
     }
@@ -395,11 +396,11 @@ static int rdmaCreateResource(RdmaContext *ctx) {
         int priority = rdmaGetJettyPriority(&dev_attr);
 
         if (priority < 0) {
-            serverLog(LL_WARNING, "RDMA: no priority supports RTP on this device");
+            serverLog(LL_WARNING, "RDMA: no priority supports CTP on this device");
             goto out;
         }
         ctx->jetty_priority = priority;
-        serverLog(LL_NOTICE, "RDMA: jetty priority %d (RTP)", priority);
+        serverLog(LL_NOTICE, "RDMA: jetty priority %d (CTP)", priority);
     }
 
     ctx->uctx = urma_create_context(dev_list[0], 0);
@@ -904,7 +905,9 @@ static int rdmaEstablish(RdmaContext *ctx) {
     if (rjetty->trans_mode == URMA_TM_RC && rjetty->flag.bs.order_type == URMA_OT) {
         rjetty->flag.bs.share_tp = 1;
     }
-    rjetty->tp_type = URMA_RTP;
+    /* bonding devices only provision CTP TP pools, keep in sync with the
+     * local jetty priority selected in rdmaCreateResource */
+    rjetty->tp_type = URMA_CTP;
 
     ctx->tjetty = urma_import_jetty(ctx->uctx, rjetty, &token);
     if (!ctx->tjetty) {
