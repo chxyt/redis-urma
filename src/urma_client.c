@@ -299,19 +299,30 @@ static int urmaCliHandleRecv(urmaClient *uc, ValkeyRdmaCmd *cmd) {
 static int urmaCliPollCq(urmaClient *uc, long long timeout_ms) {
     urma_cr_t cr = {0};
     urma_jfc_t *ev_jfc[1] = {NULL};
-    uint32_t nevents = 0;
     int polled = 0;
     int ret;
 
-    /* wait for readability on the completion event fd, then consume the
-     * event: urma_wait_jfc fills ev_jfc with the jfc owning the event,
-     * which must be passed to urma_ack_jfc afterwards */
+    /* wait for readability on the completion event fd */
     {
         struct pollfd pfd = {.fd = uc->jfce->fd, .events = POLLIN, .revents = 0};
         int rc = poll(&pfd, 1, (int)(timeout_ms < 0 ? -1 : timeout_ms));
 
         if (rc <= 0) return 0;
-        if (urma_wait_jfc(uc->jfce, 1, 0, ev_jfc) <= 0) return 0;
+    }
+
+    /* like urma_perftest wait_jfc_event(): every event consumed by
+     * wait_jfc must be acked (exactly 1 per wakeup) and re-armed BEFORE
+     * draining completions, otherwise later rearm/delete_jfc block forever
+     * on the un-acked event; urma_wait_jfc fills ev_jfc with the jfc
+     * owning the event */
+    if (urma_wait_jfc(uc->jfce, 1, 0, ev_jfc) > 0) {
+        uint32_t nevents = 1;
+
+        urma_ack_jfc(ev_jfc, &nevents, 1);
+        if (urma_rearm_jfc(ev_jfc[0], false)) {
+            uc->eof = 1;
+            return -1;
+        }
     }
 
 pollcq:
@@ -320,15 +331,6 @@ pollcq:
         uc->eof = 1;
         return -1;
     } else if (ret == 0) {
-        /* confirm the jfc events and re-arm, the order is mandatory.
-         * like urma_perftest, ack exactly 1 event per wait_jfc wakeup,
-         * acking the polled CQE count over-acks and drops later events */
-        nevents = 1;
-        urma_ack_jfc(ev_jfc, &nevents, 1);
-        if (urma_rearm_jfc(uc->jfc, false)) {
-            uc->eof = 1;
-            return -1;
-        }
         return polled > 0;
     }
 

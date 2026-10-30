@@ -790,12 +790,21 @@ static int connRdmaHandleCq(rdma_connection *rdma_conn) {
     RdmaContext *ctx = rdma_conn->ctx;
     urma_cr_t cr = {0};
     urma_jfc_t *ev_jfc[1] = {NULL};
-    uint32_t nevents = 0;
-    int polled = 0;
-    int has_event;
     int ret;
 
-    has_event = urma_wait_jfc(ctx->jfce, 1, 0, ev_jfc) > 0;
+    /* like urma_perftest wait_jfc_event(): every event consumed by
+     * wait_jfc must be acked (exactly 1 per wakeup) and re-armed BEFORE
+     * draining completions, otherwise later rearm/delete_jfc block forever
+     * on the un-acked event */
+    if (urma_wait_jfc(ctx->jfce, 1, 0, ev_jfc) > 0) {
+        uint32_t nevents = 1;
+
+        urma_ack_jfc(ev_jfc, &nevents, 1);
+        if (urma_rearm_jfc(ev_jfc[0], false)) {
+            serverLog(LL_WARNING, "RDMA: rearm jfc error");
+            return C_ERR;
+        }
+    }
 
 pollcq:
     ret = urma_poll_jfc(ctx->jfc, 1, &cr);
@@ -803,21 +812,9 @@ pollcq:
         serverLog(LL_WARNING, "RDMA: poll jfc error");
         return C_ERR;
     } else if (ret == 0) {
-        if (has_event) {
-            /* confirm the jfc events and re-arm, the order is mandatory.
-             * like urma_perftest, ack exactly 1 event per wait_jfc wakeup,
-             * acking the polled CQE count over-acks and drops later events */
-            nevents = 1;
-            urma_ack_jfc(ev_jfc, &nevents, 1);
-            if (urma_rearm_jfc(ctx->jfc, false)) {
-                serverLog(LL_WARNING, "RDMA: rearm jfc error");
-                return C_ERR;
-            }
-        }
         return C_OK;
     }
 
-    polled++;
 
     if (cr.status != URMA_CR_SUCCESS) {
         if (rdma_conn->c.state == CONN_STATE_CONNECTED) {
