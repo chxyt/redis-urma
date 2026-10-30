@@ -918,6 +918,18 @@ static int rdmaEstablish(RdmaContext *ctx) {
      * local jetty priority selected in rdmaCreateResource */
     rjetty->tp_type = URMA_CTP;
 
+    /* a plain TCP client (e.g. a redis-cli without --urma or a monitoring
+     * probe) hitting the RDMA port sends RESP bytes which deserialize into
+     * a garbage rjetty, fail fast rather than wasting the event loop on
+     * hopeless retries */
+    if (rjetty->trans_mode != URMA_TM_RM && rjetty->trans_mode != URMA_TM_RC &&
+        rjetty->trans_mode != URMA_TM_UM) {
+        serverLog(LL_WARNING, "RDMA: peer is not speaking URMA (trans_mode %llu), "
+                              "plain TCP client on the RDMA port?",
+                  (unsigned long long)rjetty->trans_mode);
+        return C_ERR;
+    }
+
     /* both peers import each other's jetty concurrently over the fast TCP
      * exchange, a transient collision is possible, retry a few times */
     for (i = 0; i < 10; i++) {
