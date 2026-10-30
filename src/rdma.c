@@ -363,6 +363,12 @@ static int rdmaGetJettyPriority(const urma_device_attr_t *dev_attr) {
     return -1;
 }
 
+/* URMA library messages (default rsyslog) are easy to miss, route them into
+ * the server log so failures like urma_import_jetty print their reason. */
+static void rdmaUrmaLog(int level, char *message) {
+    serverLog(LL_NOTICE, "URMA lib(%d): %s", level, message);
+}
+
 static int rdmaCreateResource(RdmaContext *ctx) {
     urma_device_t **dev_list = NULL;
     urma_device_attr_t dev_attr = {0};
@@ -385,6 +391,8 @@ static int rdmaCreateResource(RdmaContext *ctx) {
         return C_ERR;
     }
     ctx->max_sge = 1;
+
+    (void)urma_register_log_func(rdmaUrmaLog);
 
     if (urma_query_device(dev_list[0], &dev_attr)) {
         serverLog(LL_WARNING, "RDMA: urma query device failed");
@@ -899,6 +907,7 @@ static int rdmaEstablish(RdmaContext *ctx) {
     urma_token_t token = {.token = VALKEY_RDMA_JETTY_TOKEN};
     urma_rjetty_t *rjetty = &ctx->peer_rjetty;
     urma_status_t status;
+    int i;
 
     /* fix up the announced remote jetty transport attributes before
      * importing it, mirrors urma_perftest connect_jetty_default() */
@@ -909,7 +918,13 @@ static int rdmaEstablish(RdmaContext *ctx) {
      * local jetty priority selected in rdmaCreateResource */
     rjetty->tp_type = URMA_CTP;
 
-    ctx->tjetty = urma_import_jetty(ctx->uctx, rjetty, &token);
+    /* both peers import each other's jetty concurrently over the fast TCP
+     * exchange, a transient collision is possible, retry a few times */
+    for (i = 0; i < 10; i++) {
+        ctx->tjetty = urma_import_jetty(ctx->uctx, rjetty, &token);
+        if (ctx->tjetty) break;
+        usleep(100 * 1000);
+    }
     if (!ctx->tjetty) {
         serverLog(LL_WARNING, "RDMA: import peer jetty failed");
         return C_ERR;
